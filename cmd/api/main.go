@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -44,10 +45,31 @@ type createAssetResponse struct {
 	Status string `json:"status"`
 }
 
+type Asset struct {
+	ID         string    `json:"asset_id"`
+	Title      string    `json:"title"`
+	Status     string    `json:"status"`
+	VideoCodec *string   `json:"video_codec"`
+	Width      *int      `json:"width"`
+	Height     *int      `json:"height"`
+	DurationS  *float64  `json:"duration_s"`
+	FPS        *float64  `json:"fps"`
+	AudioCodec *string   `json:"audio_codec"`
+	Error      *string   `json:"error"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(errorResponse{Error: msg})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func makeCreateAsset(pool *pgxpool.Pool, rc *river.Client[pgx.Tx]) http.HandlerFunc {
@@ -191,19 +213,48 @@ func makeCreateAsset(pool *pgxpool.Pool, rc *river.Client[pgx.Tx]) http.HandlerF
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(createAssetResponse{
+		writeJSON(w, http.StatusCreated, createAssetResponse{
 			ID:     assetID.String(),
 			Status: "queued",
 		})
 	}
 }
 
-// SHoudl retiurn somegthing
+// URLParam → QueryRow → Scan into your Asset struct →
+// errors.Is(err, pgx.ErrNoRows) → 404, else 200 JSON.
 func makeGetAsset(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		idStr := chi.URLParam(r, "id")
 
+		assetID, err := uuid.Parse(idStr)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid asset id")
+			return
+		}
+
+		var a Asset
+		err = pool.QueryRow(r.Context(),
+			`SELECT id, title, status, video_codec, width, height, duration_s, fps, audio_codec, error, created_at, updated_at
+			FROM assets
+			WHERE id = $1`,
+			assetID,
+		).Scan(
+			&a.ID, &a.Title, &a.Status, &a.VideoCodec, &a.Width, &a.Height,
+			&a.DurationS, &a.FPS, &a.AudioCodec, &a.Error, &a.CreatedAt, &a.UpdatedAt,
+		)
+
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSONError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+
+		if err != nil {
+			slog.Error("querying asset", "err", err, "asset_id", idStr)
+			writeJSONError(w, http.StatusInternalServerError, "failed to load asset")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, a)
 	}
 }
 
