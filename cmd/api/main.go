@@ -301,7 +301,7 @@ func main() {
 	// Serve in a goroutine so main can wait for the shutdown signal.
 	go func() {
 		log.Println("api listening on :8080")
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("serve: %v", err)
 		}
 	}()

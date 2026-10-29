@@ -12,7 +12,7 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 
 	"github.com/MmedaraJ/fastforge/internal/store"
-	"github.com/MmedaraJ/fastforge/internal/worker" // you'll create this package
+	"github.com/MmedaraJ/fastforge/internal/worker"
 )
 
 func main() {
