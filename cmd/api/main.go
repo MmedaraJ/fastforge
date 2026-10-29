@@ -46,18 +46,31 @@ type createAssetResponse struct {
 }
 
 type Asset struct {
-	ID         string    `json:"asset_id"`
-	Title      string    `json:"title"`
-	Status     string    `json:"status"`
-	VideoCodec *string   `json:"video_codec"`
-	Width      *int      `json:"width"`
-	Height     *int      `json:"height"`
-	DurationS  *float64  `json:"duration_s"`
-	FPS        *float64  `json:"fps"`
-	AudioCodec *string   `json:"audio_codec"`
-	Error      *string   `json:"error"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID         string      `json:"asset_id"`
+	Title      string      `json:"title"`
+	Status     string      `json:"status"`
+	VideoCodec *string     `json:"video_codec"`
+	Width      *int        `json:"width"`
+	Height     *int        `json:"height"`
+	DurationS  *float64    `json:"duration_s"`
+	FPS        *float64    `json:"fps"`
+	AudioCodec *string     `json:"audio_codec"`
+	Renditions []Rendition `json:"renditions"`
+	Error      *string     `json:"error"`
+	CreatedAt  time.Time   `json:"created_at"`
+	UpdatedAt  time.Time   `json:"updated_at"`
+}
+
+type Rendition struct {
+	Height           int      `json:"height"`
+	Width            int      `json:"width"`
+	VideoCodec       string   `json:"video_codec"`
+	FPS              float64  `json:"fps"`
+	BitrateKbps      int      `json:"bitrate_kbps"`
+	AudioCodec       string   `json:"audio_codec"`
+	AudioBitrateKbps int      `json:"audio_bitrate_kbps"`
+	FileSizeBytes    int64    `json:"file_size_bytes"`
+	VMAF             *float64 `json:"vmaf"`
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
@@ -250,6 +263,45 @@ func makeGetAsset(pool *pgxpool.Pool) http.HandlerFunc {
 
 		if err != nil {
 			slog.Error("querying asset", "err", err, "asset_id", idStr)
+			writeJSONError(w, http.StatusInternalServerError, "failed to load asset")
+			return
+		}
+
+		rows, err := pool.Query(r.Context(),
+			`SELECT height, width, video_codec, fps, bitrate_kbps,
+					audio_codec, audio_bitrate_kbps, file_size_bytes, vmaf
+			FROM renditions
+			WHERE asset_id = $1
+			ORDER BY height DESC`, assetID)
+
+		if err != nil {
+			slog.Error("querying renditions", "err", err, "asset_id", idStr)
+			writeJSONError(w, http.StatusInternalServerError, "failed to load asset")
+			return
+		}
+		defer rows.Close()
+
+		// Not nil: a nil slice marshals to null, an empty one to [].
+		// "no renditions yet" and "this field is missing" are different things.
+		a.Renditions = []Rendition{}
+
+		for rows.Next() {
+			var rd Rendition
+			if err := rows.Scan(&rd.Height, &rd.Width, &rd.VideoCodec, &rd.FPS,
+				&rd.BitrateKbps, &rd.AudioCodec, &rd.AudioBitrateKbps,
+				&rd.FileSizeBytes, &rd.VMAF); err != nil {
+				slog.Error("scanning rendition", "err", err, "asset_id", idStr)
+				writeJSONError(w, http.StatusInternalServerError, "failed to load asset")
+				return
+			}
+			a.Renditions = append(a.Renditions, rd)
+		}
+
+		// rows.Next() returning false does NOT mean success — the iteration
+		// can fail partway. Skip this check and you silently serve a
+		// truncated list. This is the classic pgx/database-sql trap.
+		if err := rows.Err(); err != nil {
+			slog.Error("iterating renditions", "err", err, "asset_id", idStr)
 			writeJSONError(w, http.StatusInternalServerError, "failed to load asset")
 			return
 		}
