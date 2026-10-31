@@ -109,3 +109,26 @@ func TestBuildLadder(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildAudioTrack(t *testing.T) {
+	tests := []struct {
+		name  string
+		specs []RungSpec
+		want  int
+	}{
+		{"default ladder takes the highest", DefaultLadder, 128},
+		{"ladder of only low rungs", []RungSpec{{AudioBitrateKbps: 96}}, 96},
+		{"empty ladder falls back", nil, 128},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := BuildAudioTrack(tt.specs)
+			if got.BitrateKbps != tt.want {
+				t.Errorf("bitrate = %d, want %d", got.BitrateKbps, tt.want)
+			}
+			if got.Codec != AudioCodec {
+				t.Errorf("codec = %q, want %q", got.Codec, AudioCodec)
+			}
+		})
+	}
+}

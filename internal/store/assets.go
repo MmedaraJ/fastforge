@@ -87,3 +87,33 @@ func MarkReady(ctx context.Context, pool *pgxpool.Pool, assetID string) error {
 	}
 	return nil
 }
+
+// SetProgressStage records which pipeline stage is running. Informational
+// only — nothing branches on it — but it is the difference between "working"
+// and "working on what".
+func SetProgressStage(ctx context.Context, pool *pgxpool.Pool, assetID, stage string) error {
+	tag, err := pool.Exec(ctx,
+		`UPDATE assets SET progress_stage=$1, updated_at=now()
+		 WHERE id=$2 AND status='processing'`, stage, assetID)
+	if err != nil {
+		return fmt.Errorf("setting progress stage: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNoTransition
+	}
+	return nil
+}
+
+// SavePackaging records where the packaged manifests live.
+func SavePackaging(ctx context.Context, pool *pgxpool.Pool, assetID, hlsPath, dashPath string) error {
+	tag, err := pool.Exec(ctx,
+		`UPDATE assets SET hls_path=$1, dash_path=$2, updated_at=now()
+		 WHERE id=$3 AND status='processing'`, hlsPath, dashPath, assetID)
+	if err != nil {
+		return fmt.Errorf("saving packaging paths: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNoTransition
+	}
+	return nil
+}

@@ -11,6 +11,11 @@ const (
 	VideoCodec = "h264"
 	AudioCodec = "aac"
 	gopSeconds = 2
+
+	// SegmentSeconds is the packaging constraint the ladder is built against.
+	// It must stay a whole multiple of gopSeconds, or segments stop landing on
+	// keyframes. The packager must be given this same value.
+	SegmentSeconds = 6
 )
 
 // RungSpec is the configured intent for one ladder rung —
@@ -43,6 +48,33 @@ var DefaultLadder = []RungSpec{
 	{Height: 1080, BitrateKbps: 5000, MaxrateKbps: 5350, BufsizeKbps: 7500, AudioBitrateKbps: 128},
 	{Height: 720, BitrateKbps: 2800, MaxrateKbps: 2996, BufsizeKbps: 4200, AudioBitrateKbps: 128},
 	{Height: 480, BitrateKbps: 1400, MaxrateKbps: 1498, BufsizeKbps: 2100, AudioBitrateKbps: 96},
+}
+
+// AudioTrack is the single audio rendition shared by every video rung.
+// With demuxed audio there is one encode, one set of segments, and every
+// variant in the manifest points at it.
+type AudioTrack struct {
+	Codec       string
+	BitrateKbps int
+}
+
+// BuildAudioTrack picks the settings for the shared audio track.
+//
+// It takes the HIGHEST audio bitrate in the ladder, because one track now
+// serves every rung: you cannot save bits on the 480p rung's audio without
+// also degrading audio for someone watching at 1080p. The per-rung
+// AudioBitrateKbps becomes a ceiling vote rather than a per-rung setting.
+func BuildAudioTrack(specs []RungSpec) AudioTrack {
+	best := 0
+	for _, s := range specs {
+		if s.AudioBitrateKbps > best {
+			best = s.AudioBitrateKbps
+		}
+	}
+	if best == 0 {
+		best = 128 // empty ladder: a sane default rather than a silent 0k encode
+	}
+	return AudioTrack{Codec: AudioCodec, BitrateKbps: best}
 }
 
 // - probe probe.Result — reality: what the uploaded video actually is (its width, height, fps).

@@ -1,4 +1,4 @@
 pipeline/sources/
 pipeline/out/
 storage/
-.env
+.envtmp/

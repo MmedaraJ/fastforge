@@ -19,24 +19,22 @@ func SaveRendition(ctx context.Context, pool *pgxpool.Pool, assetID string,
 
 	_, err := pool.Exec(ctx,
 		`INSERT INTO renditions
-		   (id, asset_id, storage_path, file_size_bytes, video_codec, width, height,
-		    fps, bitrate_kbps, maxrate_kbps, bufsize_kbps, audio_codec, audio_bitrate_kbps)
-		 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-		 ON CONFLICT (asset_id, height) DO UPDATE SET
-		   storage_path       = EXCLUDED.storage_path,
-		   file_size_bytes    = EXCLUDED.file_size_bytes,
-		   video_codec        = EXCLUDED.video_codec,
-		   width              = EXCLUDED.width,
-		   fps                = EXCLUDED.fps,
-		   bitrate_kbps       = EXCLUDED.bitrate_kbps,
-		   maxrate_kbps       = EXCLUDED.maxrate_kbps,
-		   bufsize_kbps       = EXCLUDED.bufsize_kbps,
-		   audio_codec        = EXCLUDED.audio_codec,
-		   audio_bitrate_kbps = EXCLUDED.audio_bitrate_kbps,
-		   vmaf               = NULL,
-		   created_at         = now()`,
+			(id, asset_id, storage_path, file_size_bytes, video_codec, width, height,
+			fps, bitrate_kbps, maxrate_kbps, bufsize_kbps)
+			VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (asset_id, height) DO UPDATE SET
+			storage_path    = EXCLUDED.storage_path,
+			file_size_bytes = EXCLUDED.file_size_bytes,
+			video_codec     = EXCLUDED.video_codec,
+			width           = EXCLUDED.width,
+			fps             = EXCLUDED.fps,
+			bitrate_kbps    = EXCLUDED.bitrate_kbps,
+			maxrate_kbps    = EXCLUDED.maxrate_kbps,
+			bufsize_kbps    = EXCLUDED.bufsize_kbps,
+			vmaf            = NULL,
+			created_at      = now()`,
 		assetID, storagePath, sizeBytes, r.VideoCodec, r.Width, r.Height,
-		r.FPS, r.BitrateKbps, r.MaxrateKbps, r.BufsizeKbps, r.AudioCodec, r.AudioBitrateKbps)
+		r.FPS, r.BitrateKbps, r.MaxrateKbps, r.BufsizeKbps)
 
 	if err != nil {
 		return fmt.Errorf("saving %dp rendition: %w", r.Height, err)

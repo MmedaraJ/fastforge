@@ -6,7 +6,6 @@ import (
 	"github.com/MmedaraJ/fastforge/internal/ladder"
 )
 
-// argValue returns the argument that follows flag.
 func argValue(args []string, flag string) (string, bool) {
 	for i, a := range args {
 		if a == flag && i+1 < len(args) {
@@ -16,7 +15,16 @@ func argValue(args []string, flag string) (string, bool) {
 	return "", false
 }
 
-func TestArgs(t *testing.T) {
+func hasFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+func TestVideoArgs(t *testing.T) {
 	rung := ladder.Rung{
 		VideoCodec: "h264", AudioCodec: "aac",
 		Width: 1280, Height: 720,
@@ -24,7 +32,7 @@ func TestArgs(t *testing.T) {
 		BitrateKbps: 2800, MaxrateKbps: 2996, BufsizeKbps: 4200,
 		AudioBitrateKbps: 128,
 	}
-	args := Args("storage/sources/x.mov", rung, "storage/renditions/x/720p.mp4")
+	args := VideoArgs("storage/sources/x.mov", rung, "storage/renditions/x/720p.mp4")
 
 	t.Run("every value comes from the rung", func(t *testing.T) {
 		want := map[string]string{
@@ -35,9 +43,7 @@ func TestArgs(t *testing.T) {
 			"-vf":      "scale=1280:720",
 			"-g":       "48",
 			"-r":       "24",
-			"-b:a":     "128k",
 			"-c:v":     "libx264",
-			"-c:a":     "aac",
 		}
 		for flag, exp := range want {
 			got, ok := argValue(args, flag)
@@ -51,9 +57,24 @@ func TestArgs(t *testing.T) {
 		}
 	})
 
-	// The reason this test exists. These three flags together are what keeps
-	// segment boundaries aligned across renditions; break any of them and ABR
-	// switching glitches in ways no other test would catch.
+	// The ladder now has one shared audio track. A video rendition that
+	// smuggled its own audio in would be packaged as a second audio stream
+	// and quietly undo the whole point of demuxing.
+	t.Run("carries no audio", func(t *testing.T) {
+		if !hasFlag(args, "-an") {
+			t.Error("-an missing: video renditions must not contain audio")
+		}
+		if _, ok := argValue(args, "-c:a"); ok {
+			t.Error("-c:a present: audio is encoded separately, not per rung")
+		}
+		if _, ok := argValue(args, "-b:a"); ok {
+			t.Error("-b:a present: audio is encoded separately, not per rung")
+		}
+	})
+
+	// These three flags together keep segment boundaries aligned across
+	// renditions; break any and ABR switching glitches in ways nothing else
+	// here would catch.
 	t.Run("keyframe discipline", func(t *testing.T) {
 		g, _ := argValue(args, "-g")
 		kmin, _ := argValue(args, "-keyint_min")
@@ -70,6 +91,32 @@ func TestArgs(t *testing.T) {
 	t.Run("output path is last", func(t *testing.T) {
 		if got := args[len(args)-1]; got != "storage/renditions/x/720p.mp4" {
 			t.Errorf("last arg = %q, want the destination path", got)
+		}
+	})
+}
+
+func TestAudioArgs(t *testing.T) {
+	track := ladder.AudioTrack{Codec: "aac", BitrateKbps: 128}
+	args := AudioArgs("storage/sources/x.mov", track, "storage/renditions/x/audio.m4a")
+
+	t.Run("carries no video", func(t *testing.T) {
+		if !hasFlag(args, "-vn") {
+			t.Error("-vn missing: the audio track must not contain video")
+		}
+		if _, ok := argValue(args, "-c:v"); ok {
+			t.Error("-c:v present on an audio-only encode")
+		}
+	})
+
+	t.Run("audio settings come from the track", func(t *testing.T) {
+		if got, _ := argValue(args, "-c:a"); got != "aac" {
+			t.Errorf("-c:a = %q, want \"aac\"", got)
+		}
+		if got, _ := argValue(args, "-b:a"); got != "128k" {
+			t.Errorf("-b:a = %q, want \"128k\"", got)
+		}
+		if got, _ := argValue(args, "-ac"); got != "2" {
+			t.Errorf("-ac = %q, want \"2\" (stereo downmix)", got)
 		}
 	})
 }

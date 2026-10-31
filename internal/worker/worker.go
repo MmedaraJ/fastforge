@@ -11,6 +11,7 @@ import (
 
 	"github.com/MmedaraJ/fastforge/internal/jobs"
 	"github.com/MmedaraJ/fastforge/internal/ladder"
+	"github.com/MmedaraJ/fastforge/internal/packager"
 	"github.com/MmedaraJ/fastforge/internal/probe"
 	"github.com/MmedaraJ/fastforge/internal/store"
 	"github.com/MmedaraJ/fastforge/internal/transcode"
@@ -46,15 +47,51 @@ func (w *TranscodeWorker) Work(ctx context.Context, job *river.Job[jobs.Transcod
 	slog.Info("probed", "asset_id", id, "width", probeResult.Width,
 		"height", probeResult.Height, "fps", probeResult.FPS, "duration_s", probeResult.DurationS)
 
-	rungs, err := ladder.BuildLadder(probeResult, ladder.DefaultLadder, 6)
+	rungs, err := ladder.BuildLadder(probeResult, ladder.DefaultLadder, ladder.SegmentSeconds)
 	if err != nil {
-		return w.fail(ctx, id, job.Attempt, err) // permanent: unusable source
+		return w.fail(ctx, id, job.Attempt, err)
 	}
 	slog.Info("ladder built", "asset_id", id, "rungs", len(rungs))
 
-	if err := w.encodeRungs(ctx, id, storagePath, rungs); err != nil {
-		return w.fail(ctx, id, job.Attempt, err) // permanent: bad encode
+	// Both the audio track and every video rung land here. Create it once, up
+	// front. Before audio moved ahead of video this happened as a side effect
+	// inside encodeRungs — an undeclared dependency that broke the moment the
+	// two calls were reordered.
+	if err := os.MkdirAll(renditionDir(id), 0o755); err != nil {
+		return w.fail(ctx, id, job.Attempt, fmt.Errorf("creating rendition dir: %w", err))
 	}
+
+	// Audio first: it takes seconds, so a source with broken audio fails
+	// before we spend minutes on video.
+	var audioPath string
+	if probeResult.AudioCodec != "" {
+		track := ladder.BuildAudioTrack(ladder.DefaultLadder)
+		audioPath, err = w.encodeAudio(ctx, id, storagePath, track)
+		if err != nil {
+			return w.fail(ctx, id, job.Attempt, err)
+		}
+	} else {
+		slog.Info("source has no audio stream; packaging video only", "asset_id", id)
+	}
+
+	produced, err := w.encodeRungs(ctx, id, storagePath, rungs)
+	if err != nil {
+		return w.fail(ctx, id, job.Attempt, err)
+	}
+
+	if err := store.SetProgressStage(ctx, w.Pool, id, "packaging"); err != nil {
+		return w.transitionErr(id, job.Attempt, err)
+	}
+
+	hlsPath, dashPath, err := w.packageAsset(ctx, id, produced, audioPath)
+	if err != nil {
+		return w.fail(ctx, id, job.Attempt, err)
+	}
+	if err := store.SavePackaging(ctx, w.Pool, id, hlsPath, dashPath); err != nil {
+		return w.transitionErr(id, job.Attempt, err)
+	}
+	slog.Info("packaged", "asset_id", id, "hls", hlsPath, "dash", dashPath)
+
 	if err := store.MarkReady(ctx, w.Pool, id); err != nil {
 		return w.transitionErr(id, job.Attempt, err)
 	}
@@ -87,42 +124,88 @@ func (w *TranscodeWorker) transitionErr(id string, attempt int, err error) error
 	return fmt.Errorf("asset %s: %w", id, err)
 }
 
-// encodeRungs transcodes every rung into storage/renditions/<assetID>/ and
-// records each finished file.
-func (w *TranscodeWorker) encodeRungs(ctx context.Context, id, srcPath string, rungs []ladder.Rung) error {
-	outDir := filepath.Join("storage", "renditions", id)
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return fmt.Errorf("creating output dir: %w", err)
-	}
+// renditionDir is the single definition of where an asset's encoded files go.
+func renditionDir(id string) string {
+	return filepath.Join("storage", "renditions", id)
+}
+
+// encodeRungs transcodes every rung into storage/renditions/<assetID>/,
+// records each finished file, and returns them ready for packaging.
+func (w *TranscodeWorker) encodeRungs(ctx context.Context, id, srcPath string, rungs []ladder.Rung) ([]packager.Input, error) {
+	outDir := renditionDir(id)
+
+	produced := make([]packager.Input, 0, len(rungs))
 
 	for _, r := range rungs {
 		dst := filepath.Join(outDir, fmt.Sprintf("%dp.mp4", r.Height))
 
 		encodeCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-		err := transcode.Run(encodeCtx, srcPath, r, dst)
+		err := transcode.RunVideo(encodeCtx, srcPath, r, dst)
 		cancel() // not deferred: this is a loop
 
 		if err != nil {
-			// A killed encode leaves a truncated file with no moov atom.
-			// Don't keep something unplayable on disk.
-			os.Remove(dst)
-			return fmt.Errorf("encoding %dp: %w", r.Height, err)
+			os.Remove(dst) // a killed encode leaves an unplayable file
+			return nil, fmt.Errorf("encoding %dp: %w", r.Height, err)
 		}
 
 		info, err := os.Stat(dst)
 		if err != nil {
-			return fmt.Errorf("stat %dp output: %w", r.Height, err)
+			return nil, fmt.Errorf("stat %dp output: %w", r.Height, err)
 		}
 
 		if err := store.SaveRendition(ctx, w.Pool, id, r, dst, info.Size()); err != nil {
-			return err
+			return nil, err
 		}
+
+		produced = append(produced, packager.Input{Path: dst, Height: r.Height})
 
 		slog.Info("rendition encoded",
 			"asset_id", id, "height", r.Height,
 			"bytes", info.Size(), "path", dst)
 	}
-	return nil
+	return produced, nil
+}
+
+// encodeAudio produces the single audio track shared by every rung. Returns
+// an empty path when the source has no audio at all — a legitimate case
+// (silent footage), not a failure.
+func (w *TranscodeWorker) encodeAudio(ctx context.Context, id, srcPath string, track ladder.AudioTrack) (string, error) {
+	dst := filepath.Join(renditionDir(id), "audio.m4a")
+
+	encodeCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	if err := transcode.RunAudio(encodeCtx, srcPath, track, dst); err != nil {
+		os.Remove(dst)
+		return "", err
+	}
+
+	info, err := os.Stat(dst)
+	if err != nil {
+		return "", fmt.Errorf("stat audio output: %w", err)
+	}
+
+	if err := store.SaveAudioTrack(ctx, w.Pool, id, dst, track.BitrateKbps); err != nil {
+		return "", err
+	}
+
+	slog.Info("audio encoded", "asset_id", id,
+		"bitrate_kbps", track.BitrateKbps, "bytes", info.Size(), "path", dst)
+	return dst, nil
+}
+
+func (w *TranscodeWorker) packageAsset(ctx context.Context, id string, video []packager.Input, audioPath string) (string, string, error) {
+	outDir := filepath.Join("storage", "packaged", id)
+
+	packCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+
+	if err := packager.Run(packCtx, video, audioPath, outDir, ladder.SegmentSeconds); err != nil {
+		return "", "", err
+	}
+
+	hls, dash := packager.ManifestPaths(outDir)
+	return hls, dash, nil
 }
 
 // Timeout disables River's per-job deadline for transcode jobs. River's

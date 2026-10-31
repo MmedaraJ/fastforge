@@ -46,31 +46,32 @@ type createAssetResponse struct {
 }
 
 type Asset struct {
-	ID         string      `json:"asset_id"`
-	Title      string      `json:"title"`
-	Status     string      `json:"status"`
-	VideoCodec *string     `json:"video_codec"`
-	Width      *int        `json:"width"`
-	Height     *int        `json:"height"`
-	DurationS  *float64    `json:"duration_s"`
-	FPS        *float64    `json:"fps"`
-	AudioCodec *string     `json:"audio_codec"`
-	Renditions []Rendition `json:"renditions"`
-	Error      *string     `json:"error"`
-	CreatedAt  time.Time   `json:"created_at"`
-	UpdatedAt  time.Time   `json:"updated_at"`
+	ID               string      `json:"asset_id"`
+	Title            string      `json:"title"`
+	Status           string      `json:"status"`
+	VideoCodec       *string     `json:"video_codec"`
+	Width            *int        `json:"width"`
+	Height           *int        `json:"height"`
+	DurationS        *float64    `json:"duration_s"`
+	FPS              *float64    `json:"fps"`
+	AudioCodec       *string     `json:"audio_codec"`
+	AudioBitrateKbps *int        `json:"audio_bitrate_kbps"`
+	Renditions       []Rendition `json:"renditions"`
+	HLSURL           *string     `json:"hls_url"`
+	DASHURL          *string     `json:"dash_url"`
+	Error            *string     `json:"error"`
+	CreatedAt        time.Time   `json:"created_at"`
+	UpdatedAt        time.Time   `json:"updated_at"`
 }
 
 type Rendition struct {
-	Height           int      `json:"height"`
-	Width            int      `json:"width"`
-	VideoCodec       string   `json:"video_codec"`
-	FPS              float64  `json:"fps"`
-	BitrateKbps      int      `json:"bitrate_kbps"`
-	AudioCodec       string   `json:"audio_codec"`
-	AudioBitrateKbps int      `json:"audio_bitrate_kbps"`
-	FileSizeBytes    int64    `json:"file_size_bytes"`
-	VMAF             *float64 `json:"vmaf"`
+	Height        int      `json:"height"`
+	Width         int      `json:"width"`
+	VideoCodec    string   `json:"video_codec"`
+	FPS           float64  `json:"fps"`
+	BitrateKbps   int      `json:"bitrate_kbps"`
+	FileSizeBytes int64    `json:"file_size_bytes"`
+	VMAF          *float64 `json:"vmaf"`
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
@@ -246,14 +247,18 @@ func makeGetAsset(pool *pgxpool.Pool) http.HandlerFunc {
 		}
 
 		var a Asset
+		var hlsPath, dashPath *string
+
 		err = pool.QueryRow(r.Context(),
-			`SELECT id, title, status, video_codec, width, height, duration_s, fps, audio_codec, error, created_at, updated_at
-			FROM assets
-			WHERE id = $1`,
+			`SELECT id, title, status, video_codec, width, height, duration_s, fps,
+			        audio_codec, audio_bitrate_kbps, error, created_at, updated_at, hls_path, dash_path
+			 FROM assets
+			 WHERE id = $1`,
 			assetID,
 		).Scan(
 			&a.ID, &a.Title, &a.Status, &a.VideoCodec, &a.Width, &a.Height,
-			&a.DurationS, &a.FPS, &a.AudioCodec, &a.Error, &a.CreatedAt, &a.UpdatedAt,
+			&a.DurationS, &a.FPS, &a.AudioCodec, &a.AudioBitrateKbps, &a.Error, &a.CreatedAt, &a.UpdatedAt,
+			&hlsPath, &dashPath,
 		)
 
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -267,9 +272,20 @@ func makeGetAsset(pool *pgxpool.Pool) http.HandlerFunc {
 			return
 		}
 
+		// The database stores a storage path; the API publishes a URL. Keeping
+		// those separate means the disk layout can change without breaking the
+		// contract — and when these files move to a CDN, only this bit changes.
+		if hlsPath != nil {
+			u := "/media/" + strings.TrimPrefix(*hlsPath, "storage/")
+			a.HLSURL = &u
+		}
+		if dashPath != nil {
+			u := "/media/" + strings.TrimPrefix(*dashPath, "storage/")
+			a.DASHURL = &u
+		}
+
 		rows, err := pool.Query(r.Context(),
-			`SELECT height, width, video_codec, fps, bitrate_kbps,
-					audio_codec, audio_bitrate_kbps, file_size_bytes, vmaf
+			`SELECT height, width, video_codec, fps, bitrate_kbps, file_size_bytes, vmaf
 			FROM renditions
 			WHERE asset_id = $1
 			ORDER BY height DESC`, assetID)
@@ -288,8 +304,7 @@ func makeGetAsset(pool *pgxpool.Pool) http.HandlerFunc {
 		for rows.Next() {
 			var rd Rendition
 			if err := rows.Scan(&rd.Height, &rd.Width, &rd.VideoCodec, &rd.FPS,
-				&rd.BitrateKbps, &rd.AudioCodec, &rd.AudioBitrateKbps,
-				&rd.FileSizeBytes, &rd.VMAF); err != nil {
+				&rd.BitrateKbps, &rd.FileSizeBytes, &rd.VMAF); err != nil {
 				slog.Error("scanning rendition", "err", err, "asset_id", idStr)
 				writeJSONError(w, http.StatusInternalServerError, "failed to load asset")
 				return
@@ -308,6 +323,24 @@ func makeGetAsset(pool *pgxpool.Pool) http.HandlerFunc {
 
 		writeJSON(w, http.StatusOK, a)
 	}
+}
+
+// withMediaCORS lets a player on another origin (the hls.js demo page) fetch
+// segments. The browser enforces CORS; the server only declares who is
+// allowed. Expose-Headers matters because players issue byte-range requests
+// and need to read Content-Range off the response.
+func withMediaCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Range")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func main() {
@@ -347,6 +380,12 @@ func main() {
 	r := chi.NewRouter()
 	r.Post("/assets", makeCreateAsset(pool, riverClient))
 	r.Get("/assets/{id}", makeGetAsset(pool))
+	// Dev only. In production these bytes come from a CDN, and this route
+	// disappears. http.FileServer returns a Handler; StripPrefix wraps one
+	// and returns another; withMediaCORS wraps that. Three decorators,
+	// same shape as a Reader wrapping a Reader.
+	media := http.FileServer(http.Dir("storage"))
+	r.Handle("/media/*", withMediaCORS(http.StripPrefix("/media/", media)))
 
 	srv := &http.Server{Addr: ":8080", Handler: r}
 
