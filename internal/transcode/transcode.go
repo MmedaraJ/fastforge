@@ -78,8 +78,9 @@ func RunAudio(ctx context.Context, srcPath string, t ladder.AudioTrack, dstPath 
 	return Run(ctx, AudioArgs(srcPath, t, dstPath), "audio")
 }
 
-// run execs ffmpeg and turns a failure into an error carrying its stderr.
-// Both callers need identical plumbing, so it lives in one unexported place.
+// Run execs ffmpeg and turns a failure into an error carrying its stderr.
+// Every caller needs identical plumbing — RunVideo, RunAudio and the vmaf
+// package — so it lives in one place.
 func Run(ctx context.Context, args []string, label string) error {
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 

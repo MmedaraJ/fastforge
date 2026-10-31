@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fastforge player</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #262d36;
+    --fg: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --good: #3fb950; --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 15px; font-weight: 600; margin: 0 0 16px; letter-spacing: .02em; }
+  h1 span { color: var(--dim); font-weight: 400; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  input, select, button {
+    font: inherit; background: var(--panel); color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 7px 10px;
+  }
+  input { flex: 1 1 320px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  button { cursor: pointer; border-color: #30414f; }
+  button:hover { border-color: var(--accent); }
+  video { width: 100%; background: #000; border-radius: 8px; display: block; }
+  .stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
+    gap: 1px; background: var(--line); border: 1px solid var(--line);
+    border-radius: 8px; overflow: hidden; margin: 16px 0;
+  }
+  .stat { background: var(--panel); padding: 10px 12px; }
+  .stat .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .stat .v { font-family: ui-monospace, Menlo, monospace; font-size: 16px; margin-top: 2px; }
+  .v.good { color: var(--good); } .v.warn { color: var(--warn); }
+  #log {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; height: 190px; overflow-y: auto;
+    font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.7;
+  }
+  #log div { white-space: pre; }
+  #log .t { color: var(--dim); }
+  #log .sw { color: var(--accent); }
+  #log .er { color: #f85149; }
+  p.hint { color: var(--dim); font-size: 12px; margin: 12px 0 0; }
+  code { font-family: ui-monospace, Menlo, monospace; color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+  <h1>fastforge <span>— playback smoke test</span></h1>
+
+  <div class="bar">
+    <input id="asset" placeholder="asset id, or a full .m3u8 URL" spellcheck="false">
+    <select id="level"><option value="-1">auto</option></select>
+    <button id="load">load</button>
+  </div>
+
+  <video id="v" controls muted playsinline></video>
+
+  <div class="stats">
+    <div class="stat"><div class="k">first frame</div><div class="v" id="ttff">—</div></div>
+    <div class="stat"><div class="k">level</div><div class="v" id="lvl">—</div></div>
+    <div class="stat"><div class="k">bitrate</div><div class="v" id="br">—</div></div>
+    <div class="stat"><div class="k">buffer</div><div class="v" id="buf">—</div></div>
+    <div class="stat"><div class="k">switches</div><div class="v" id="sw">0</div></div>
+    <div class="stat"><div class="k">rebuffers</div><div class="v" id="rb">0</div></div>
+    <div class="stat"><div class="k">stalled</div><div class="v" id="st">0.0s</div></div>
+    <div class="stat"><div class="k">dropped</div><div class="v" id="dr">0</div></div>
+  </div>
+
+  <div id="log"></div>
+
+  <p class="hint">
+    Throttle the connection in DevTools → Network while it plays and watch the level drop.
+    Every segment request is visible there too — <code>init.mp4</code> once, then <code>$Number$.m4s</code> in sequence.
+  </p>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<script>
+const API = "http://localhost:8080";
+const $ = id => document.getElementById(id);
+const v = $("v");
+
+let hls, t0 = 0, firstFrame = false;
+let switches = 0, rebuffers = 0, stalledMs = 0, stallStart = 0;
+
+function log(msg, cls = "") {
+  const at = t0 ? ((performance.now() - t0) / 1000).toFixed(2).padStart(6) : " 0.00";
+  const line = document.createElement("div");
+  line.innerHTML = `<span class="t">${at}s</span>  <span class="${cls}">${msg}</span>`;
+  $("log").appendChild(line);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function sourceURL(raw) {
+  const s = raw.trim();
+  if (!s) return null;
+  if (s.startsWith("http")) return s;
+  return `${API}/media/packaged/${s}/master.m3u8`;
+}
+
+function load() {
+  const url = sourceURL($("asset").value);
+  if (!url) return;
+
+  if (hls) hls.destroy();
+  $("log").innerHTML = "";
+  switches = rebuffers = stalledMs = 0; stallStart = 0; firstFrame = false;
+  $("level").length = 1;
+  t0 = performance.now();
+  log(`GET ${url}`);
+
+  if (!Hls.isSupported()) {
+    // Safari plays HLS natively through the video element; hls.js is never used
+    // there, so none of the level instrumentation below will fire.
+    v.src = url;
+    log("native HLS (hls.js unsupported) — no level stats", "warn");
+    v.play().catch(() => {});
+    return;
+  }
+
+  // ?start=0 pins the opening rung. Default (-1) lets hls.js guess from its
+  // built-in estimate, which is the whole startup-latency problem in one line:
+  // it has measured nothing yet, so it picks on faith and pays for a bad call.
+  const startLevel = Number(new URLSearchParams(location.search).get("start") ?? -1);
+  hls = new Hls({ debug: false, startLevel });
+  if (startLevel >= 0) log(`start level pinned to ${startLevel}`);
+  hls.loadSource(url);
+  hls.attachMedia(v);
+
+  hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+    log(`manifest parsed — ${data.levels.length} levels`);
+    data.levels.forEach((l, i) => {
+      log(`  [${i}] ${l.width}x${l.height}  ${Math.round(l.bitrate / 1000)} kbps`);
+      const o = document.createElement("option");
+      o.value = i;
+      o.textContent = `${l.height}p`;
+      $("level").appendChild(o);
+    });
+    // data.audioTracks, not hls.audioTracks: the property is filled by hls.js's
+    // own MANIFEST_PARSED listener, and listener order is not guaranteed.
+    const a = data.audioTracks || [];
+    log(`audio tracks: ${a.length}${a.length ? ` — group "${a[0].groupId}", ${a[0].channels || "?"}ch` : ""}`);
+    v.play().catch(() => log("autoplay blocked — press play", "warn"));
+  });
+
+  hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+    const l = hls.levels[data.level];
+    switches++;
+    $("sw").textContent = switches;
+    log(`→ level ${data.level}  ${l.height}p  ${Math.round(l.bitrate / 1000)} kbps`, "sw");
+  });
+
+  hls.on(Hls.Events.ERROR, (_, data) => {
+    log(`${data.type} / ${data.details}${data.fatal ? " (fatal)" : ""}`, "er");
+    if (data.fatal) hls.destroy();
+  });
+}
+
+// Startup latency: the clock starts when we ask for the manifest and stops on
+// the first frame the viewer actually sees. Everything in between — manifest,
+// init segment, first media segment, decode — is what the number measures.
+v.addEventListener("playing", () => {
+  if (!firstFrame) {
+    firstFrame = true;
+    const ms = performance.now() - t0;
+    $("ttff").textContent = `${Math.round(ms)}ms`;
+    $("ttff").className = "v " + (ms < 1000 ? "good" : "warn");
+    log(`first frame — ${Math.round(ms)}ms`, "sw");
+  } else if (stallStart) {
+    stalledMs += performance.now() - stallStart;
+    stallStart = 0;
+  }
+});
+
+// 'waiting' after playback has begun means the buffer ran dry: a rebuffer.
+v.addEventListener("waiting", () => {
+  if (!firstFrame) return;
+  rebuffers++; stallStart = performance.now();
+  $("rb").textContent = rebuffers;
+  $("rb").className = "v warn";
+  log("rebuffer — buffer ran dry", "er");
+});
+
+$("level").addEventListener("change", e => {
+  if (!hls) return;
+  hls.currentLevel = Number(e.target.value);
+  log(`level forced to ${e.target.value === "-1" ? "auto" : e.target.value}`);
+});
+
+$("load").addEventListener("click", load);
+$("asset").addEventListener("keydown", e => { if (e.key === "Enter") load(); });
+
+setInterval(() => {
+  if (hls && hls.currentLevel >= 0) {
+    const l = hls.levels[hls.currentLevel];
+    $("lvl").textContent = `${l.height}p`;
+    $("br").textContent = `${Math.round(l.bitrate / 1000)}k`;
+  }
+  let ahead = 0;
+  for (let i = 0; i < v.buffered.length; i++) {
+    if (v.currentTime >= v.buffered.start(i) && v.currentTime <= v.buffered.end(i)) {
+      ahead = v.buffered.end(i) - v.currentTime;
+    }
+  }
+  $("buf").textContent = `${ahead.toFixed(1)}s`;
+  $("buf").className = "v " + (ahead > 4 ? "good" : ahead > 1 ? "warn" : "");
+  $("st").textContent = `${((stalledMs + (stallStart ? performance.now() - stallStart : 0)) / 1000).toFixed(1)}s`;
+  const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+  if (q) $("dr").textContent = q.droppedVideoFrames;
+}, 250);
+
+// ?asset=<id> loads straight away, so a reload after a code change costs nothing.
+const qs = new URLSearchParams(location.search).get("asset");
+if (qs) { $("asset").value = qs; load(); }
+</script>
+</body>
+</html>

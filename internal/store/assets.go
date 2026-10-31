@@ -117,3 +117,22 @@ func SavePackaging(ctx context.Context, pool *pgxpool.Pool, assetID, hlsPath, da
 	}
 	return nil
 }
+
+// SaveVMAF records a rendition's quality score. The rendition row already
+// exists — SaveRendition wrote it during encoding and set vmaf to NULL — so
+// this is an update, and a zero row count means the encode and the measurement
+// disagree about which renditions exist.
+func SaveVMAF(ctx context.Context, pool *pgxpool.Pool, assetID string, height int, score float64) error {
+	tag, err := pool.Exec(ctx, `
+		UPDATE renditions
+		   SET vmaf = $3
+		 WHERE asset_id = $1 AND height = $2`,
+		assetID, height, score)
+	if err != nil {
+		return fmt.Errorf("saving vmaf: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("saving vmaf: no %dp rendition for asset %s", height, assetID)
+	}
+	return nil
+}

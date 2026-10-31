@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"os"
+
+	"os/exec"
 	"os/signal"
 	"syscall"
 
@@ -30,9 +35,13 @@ func main() {
 
 	pool, err := store.NewPool(ctx, dbURL)
 	if err != nil {
-		log.Fatalf("store: %v", err)
+		log.Fatalf("database: %v", err)
 	}
 	defer pool.Close()
+
+	if err := checkTooling(ctx); err != nil {
+		log.Fatalf("worker cannot start: %v", err)
+	}
 
 	// --- where the worker diverges from the API ---
 
@@ -71,4 +80,36 @@ func main() {
 	if err := client.Stop(context.Background()); err != nil {
 		log.Printf("stop: %v", err)
 	}
+}
+
+// checkTooling verifies the external binaries this worker shells out to,
+// at startup rather than mid-job.
+//
+// Every pipeline stage execs something: ffprobe to inspect, ffmpeg to encode
+// and score, packager to segment. When one is missing — or present but built
+// without a feature we need — the failure surfaces deep inside a job, gets
+// classified as bad media, and marks the asset permanently failed. You would
+// then go looking at the video, while the real problem is this machine's PATH.
+//
+// Costs about 50ms once. Buys a startup crash with a sentence that names what
+// to install.
+func checkTooling(ctx context.Context) error {
+	// LookPath answers "does this binary exist", which is all these two need.
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		return fmt.Errorf("ffprobe not found on PATH: %w", err)
+	}
+	if _, err := exec.LookPath("packager"); err != nil {
+		return fmt.Errorf("shaka packager not found on PATH — brew install shaka-packager: %w", err)
+	}
+
+	// ffmpeg needs more than existence: it has to have been COMPILED with
+	// libvmaf. The only way to know is to ask it what filters it has.
+	out, err := exec.CommandContext(ctx, "ffmpeg", "-hide_banner", "-filters").Output()
+	if err != nil {
+		return fmt.Errorf("ffmpeg not usable: %w", err)
+	}
+	if !bytes.Contains(out, []byte("libvmaf")) {
+		return errors.New("this ffmpeg has no libvmaf filter; quality measurement would fail every asset — brew reinstall ffmpeg")
+	}
+	return nil
 }
