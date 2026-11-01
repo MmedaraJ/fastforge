@@ -13,6 +13,7 @@ import (
 	"github.com/MmedaraJ/fastforge/internal/ladder"
 	"github.com/MmedaraJ/fastforge/internal/packager"
 	"github.com/MmedaraJ/fastforge/internal/probe"
+	"github.com/MmedaraJ/fastforge/internal/storage"
 	"github.com/MmedaraJ/fastforge/internal/store"
 	"github.com/MmedaraJ/fastforge/internal/transcode"
 	"github.com/MmedaraJ/fastforge/internal/vmaf"
@@ -22,7 +23,14 @@ import (
 
 type TranscodeWorker struct {
 	river.WorkerDefaults[jobs.TranscodeArgs]
-	Pool *pgxpool.Pool
+	Pool     *pgxpool.Pool
+	Uploader storage.Uploader
+}
+
+// packagedDir is the single definition of where an asset's packaged output
+// goes, matching renditionDir.
+func packagedDir(id string) string {
+	return filepath.Join("storage", "packaged", id)
 }
 
 func (w *TranscodeWorker) Work(ctx context.Context, job *river.Job[jobs.TranscodeArgs]) error {
@@ -107,6 +115,19 @@ func (w *TranscodeWorker) process(ctx context.Context, id, storagePath string) e
 		return err
 	}
 	slog.Info("packaged", "asset_id", id, "hls", hlsPath, "dash", dashPath)
+
+	if err := store.SetProgressStage(ctx, w.Pool, id, "publishing"); err != nil {
+		return err
+	}
+	// Deliberately NOT tagged badMedia. A failed upload is credentials, a
+	// network, or Cloudflare having a bad minute — never the asset's fault —
+	// so Work routes it back to the queue. Retrying is safe because writing
+	// the same key twice is idempotent: the second attempt simply overwrites
+	// whatever the first one managed to put there.
+	if err := w.Uploader.Upload(ctx, packagedDir(id), "packaged/"+id); err != nil {
+		return fmt.Errorf("publishing: %w", err)
+	}
+	slog.Info("published", "asset_id", id)
 	return nil
 }
 
@@ -255,7 +276,7 @@ func (w *TranscodeWorker) encodeAudio(ctx context.Context, id, srcPath string, t
 }
 
 func (w *TranscodeWorker) packageAsset(ctx context.Context, id string, video []packager.Input, audioPath string) (string, string, error) {
-	outDir := filepath.Join("storage", "packaged", id)
+	outDir := packagedDir(id)
 
 	packCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
@@ -295,7 +316,11 @@ func (w *TranscodeWorker) measureQuality(ctx context.Context, id, srcPath string
 	for _, in := range video {
 		score, err := vmaf.Run(ctx, in.Path, srcPath, src.Width, src.Height)
 		if err != nil {
-			return badMedia(fmt.Errorf("scoring %dp: %w", in.Height, err))
+			// Untagged: scoring can fail because the report was unreadable or
+			// libvmaf's JSON schema didn't match what we parse. Neither is the
+			// asset's fault, and permanently failing a good encode over a
+			// transient read is worse than scoring it twice.
+			return fmt.Errorf("scoring %dp: %w", in.Height, err)
 		}
 
 		if err := store.SaveVMAF(ctx, w.Pool, id, in.Height, score.Mean); err != nil {
@@ -305,6 +330,8 @@ func (w *TranscodeWorker) measureQuality(ctx context.Context, id, srcPath string
 		slog.Info("quality scored", "asset_id", id, "height", in.Height,
 			"vmaf", score.Mean, "harmonic", score.HarmonicMean, "min", score.Min)
 
+		// Still tagged: the gate is a judgement about the media itself, and
+		// rescoring the same bytes produces the same number.
 		if in.Height == top && score.HarmonicMean < vmaf.TopRungFloor {
 			return badMedia(fmt.Errorf("quality gate: %dp scored %.2f, floor is %.1f",
 				in.Height, score.HarmonicMean, vmaf.TopRungFloor))

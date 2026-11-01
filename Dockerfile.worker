@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+
+# ---- build ----
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/worker ./cmd/worker
+
+# ---- ffmpeg ----
+# Debian's ffmpeg is compiled without libvmaf, so these come from an image
+# published specifically to supply ffmpeg binaries. They are statically linked,
+# which means no shared-library matching against the runtime base below, and
+# the tag is pinned for the same reproducibility reason as packager.
+FROM mwader/static-ffmpeg:7.1 AS ffmpeg
+
+# ---- runtime ----
+# The worker's runtime is not really a Go runtime: it is a media toolchain that
+# happens to be driven by a Go binary. ffmpeg, ffprobe and packager are as much
+# a part of this image as the compiled worker is, which is exactly why it gets
+# its own Dockerfile rather than sharing one with the API.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
+
+# Pinned on purpose. Encoder and packager versions change their output, so a
+# floating version would quietly invalidate every VMAF score this project has
+# measured. Reproducible encodes require a frozen toolchain.
+ARG PACKAGER_VERSION=v3.9.3
+# TARGETARCH is supplied by BuildKit and reflects the image being built, so an
+# Apple Silicon Mac gets the arm64 build natively instead of crawling through
+# emulation. Hardcoding x64 here would make every encode several times slower.
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) PKG_ARCH=x64 ;; \
+      arm64) PKG_ARCH=arm64 ;; \
+      *) echo "unsupported architecture: $TARGETARCH" && exit 1 ;; \
+    esac \
+ && curl -fsSL -o /usr/local/bin/packager \
+      "https://github.com/shaka-project/shaka-packager/releases/download/${PACKAGER_VERSION}/packager-linux-${PKG_ARCH}" \
+ && chmod +x /usr/local/bin/packager
+
+# Assert the image can actually do its job, at BUILD time. Without this, a
+# distro ffmpeg compiled without libvmaf would build fine and then fail days
+# later as a rejected asset. Fail the build, not the job.
+RUN ffmpeg -hide_banner -filters | grep -q libvmaf \
+ && ffprobe -version > /dev/null \
+ && packager --version
+
+WORKDIR /app
+COPY --from=build /out/worker /usr/local/bin/worker
+
+CMD ["worker"]

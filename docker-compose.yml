@@ -9,5 +9,48 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    # Without a healthcheck, depends_on only waits for the container to start,
+    # not for Postgres to accept connections — so the worker would race the
+    # database on every cold boot and fail its first Ping.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastforge -d fastforge"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      # Overrides the .env value. Inside the compose network the database is
+      # reachable as "db", not localhost; `environment:` takes precedence over
+      # `env_file:`, so one line here beats maintaining two .env files.
+      DATABASE_URL: postgres://fastforge:fastforge@db:5432/fastforge?sslmode=disable
+    volumes:
+      # Bind mount rather than a named volume: renditions, manifests and the
+      # VMAF reports stay visible on your Mac, so inspecting output does not
+      # require docker exec.
+      - ./storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://fastforge:fastforge@db:5432/fastforge?sslmode=disable
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:

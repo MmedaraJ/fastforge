@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/MmedaraJ/fastforge/internal/jobs"
+	"github.com/MmedaraJ/fastforge/internal/storage"
 	"github.com/MmedaraJ/fastforge/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -236,7 +238,7 @@ func makeCreateAsset(pool *pgxpool.Pool, rc *river.Client[pgx.Tx]) http.HandlerF
 
 // URLParam → QueryRow → Scan into your Asset struct →
 // errors.Is(err, pgx.ErrNoRows) → 404, else 200 JSON.
-func makeGetAsset(pool *pgxpool.Pool) http.HandlerFunc {
+func makeGetAsset(pool *pgxpool.Pool, mediaBase string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		idStr := chi.URLParam(r, "id")
 
@@ -276,11 +278,11 @@ func makeGetAsset(pool *pgxpool.Pool) http.HandlerFunc {
 		// those separate means the disk layout can change without breaking the
 		// contract — and when these files move to a CDN, only this bit changes.
 		if hlsPath != nil {
-			u := "/media/" + strings.TrimPrefix(*hlsPath, "storage/")
+			u := mediaBase + "/" + strings.TrimPrefix(*hlsPath, "storage/")
 			a.HLSURL = &u
 		}
 		if dashPath != nil {
-			u := "/media/" + strings.TrimPrefix(*dashPath, "storage/")
+			u := mediaBase + "/" + strings.TrimPrefix(*dashPath, "storage/")
 			a.DASHURL = &u
 		}
 
@@ -343,6 +345,31 @@ func withMediaCORS(next http.Handler) http.Handler {
 	})
 }
 
+// withAPICORS lets a browser-based player on another origin read asset
+// metadata. Deliberately applied to the read route only: the upload endpoint
+// stays same-origin, because a wildcard on a POST that writes files to disk is
+// an entirely different risk from one on a JSON GET.
+func withAPICORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withMediaHeaders gives locally-served files the same Content-Type and
+// Cache-Control they will get from the object store, so development and
+// production differ in hostname only.
+func withMediaHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ct := storage.ContentType(r.URL.Path); ct != "application/octet-stream" {
+			w.Header().Set("Content-Type", ct)
+		}
+		w.Header().Set("Cache-Control", storage.CacheControl(r.URL.Path))
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	// ctx is cancelled when the process receives Ctrl-C / SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(),
@@ -353,6 +380,8 @@ func main() {
 	// in production there is no .env file (real env vars are set by the
 	// platform), so "file not found" must not be fatal.
 	_ = godotenv.Load()
+	// Read after godotenv.Load, never at package level — see the init-order trap.
+	mediaBase := cmp.Or(os.Getenv("MEDIA_BASE_URL"), "/media")
 
 	// Get DATABASE_URL which is needed here
 	dbURL := os.Getenv("DATABASE_URL")
@@ -379,13 +408,14 @@ func main() {
 	// routing: build the dispatcher and register handlers
 	r := chi.NewRouter()
 	r.Post("/assets", makeCreateAsset(pool, riverClient))
-	r.Get("/assets/{id}", makeGetAsset(pool))
+	r.Get("/assets/{id}", makeGetAsset(pool, mediaBase))
+	r.With(withAPICORS).Get("/assets/{id}", makeGetAsset(pool, mediaBase))
 	// Dev only. In production these bytes come from a CDN, and this route
 	// disappears. http.FileServer returns a Handler; StripPrefix wraps one
 	// and returns another; withMediaCORS wraps that. Three decorators,
 	// same shape as a Reader wrapping a Reader.
 	media := http.FileServer(http.Dir("storage"))
-	r.Handle("/media/*", withMediaCORS(http.StripPrefix("/media/", media)))
+	r.Handle("/media/*", withMediaCORS(withMediaHeaders(http.StripPrefix("/media/", media))))
 
 	srv := &http.Server{Addr: ":8080", Handler: r}
 

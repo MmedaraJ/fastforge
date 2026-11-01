@@ -16,6 +16,7 @@ import (
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 
+	"github.com/MmedaraJ/fastforge/internal/storage"
 	"github.com/MmedaraJ/fastforge/internal/store"
 	"github.com/MmedaraJ/fastforge/internal/worker"
 )
@@ -43,13 +44,35 @@ func main() {
 		log.Fatalf("worker cannot start: %v", err)
 	}
 
+	// Configuration decides which uploader exists; nothing downstream knows or
+	// cares which one it got. Missing credentials is a valid configuration, not
+	// an error — it means "serve from the local origin."
+	var uploader storage.Uploader = storage.Local{}
+	if acct := os.Getenv("R2_ACCOUNT_ID"); acct != "" {
+		r2, err := storage.NewR2(ctx, acct,
+			os.Getenv("R2_ACCESS_KEY_ID"),
+			os.Getenv("R2_SECRET_ACCESS_KEY"),
+			os.Getenv("R2_BUCKET"),
+		)
+		if err != nil {
+			log.Fatalf("r2: %v", err)
+		}
+		uploader = r2
+		log.Println("publishing to R2")
+	} else {
+		log.Println("publishing locally (no R2 configured)")
+	}
+
 	// --- where the worker diverges from the API ---
 
 	// 1. The registry: maps Kind() strings → worker types.
 	//    Your TranscodeArgs.Kind() returns "transcode"; this line is
 	//    the other half of that handshake.
 	workers := river.NewWorkers()
-	river.AddWorker(workers, &worker.TranscodeWorker{Pool: pool})
+	river.AddWorker(workers, &worker.TranscodeWorker{
+		Pool:     pool,
+		Uploader: uploader,
+	})
 
 	// 2. A CONSUMING client. The API's client had no Queues and no
 	//    Workers — that's all "insert-only" meant. This one has both,

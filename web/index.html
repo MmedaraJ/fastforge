@@ -96,21 +96,52 @@ function log(msg, cls = "") {
   $("log").scrollTop = $("log").scrollHeight;
 }
 
-function sourceURL(raw) {
+// The API owns where media lives — it builds hls_url from MEDIA_BASE_URL. The
+// player asks rather than reconstructing the URL from parts, so switching to a
+// CDN is a server-side config change and this file never learns about it.
+async function resolveSource(raw) {
   const s = raw.trim();
   if (!s) return null;
-  if (s.startsWith("http")) return s;
-  return `${API}/media/packaged/${s}/master.m3u8`;
+  if (s.startsWith("http")) return s; // a pasted manifest URL wins
+
+  const res = await fetch(`${API}/assets/${s}`);
+  if (!res.ok) throw new Error(`asset lookup failed: ${res.status}`);
+
+  const a = await res.json();
+  if (!a.hls_url) throw new Error(`no hls_url — asset status is "${a.status}"`);
+
+  logMeta(a);
+  // hls_url is absolute when a CDN is configured and root-relative otherwise.
+  return a.hls_url.startsWith("http") ? a.hls_url : API + a.hls_url;
 }
 
-function load() {
-  const url = sourceURL($("asset").value);
-  if (!url) return;
+function logMeta(a) {
+  log(`"${a.title}" — ${a.width}x${a.height} ${a.fps}fps ${a.duration_s.toFixed(2)}s`);
+  for (const r of a.renditions || []) {
+    const v = r.vmaf == null ? "—" : r.vmaf.toFixed(2);
+    log(`  ${String(r.height).padStart(4)}p  ${String(r.bitrate_kbps).padStart(5)} kbps  vmaf ${v}`);
+  }
+}
 
+async function load() {
   if (hls) hls.destroy();
   $("log").innerHTML = "";
   switches = rebuffers = stalledMs = 0; stallStart = 0; firstFrame = false;
   $("level").length = 1;
+  t0 = 0;
+
+  let url;
+  try {
+    url = await resolveSource($("asset").value);
+  } catch (e) {
+    log(e.message, "er");
+    return;
+  }
+  if (!url) return;
+
+  // The clock starts at the manifest request, not at the metadata lookup —
+  // a real player already knows its URL, so timing our own API call would
+  // inflate every startup number.
   t0 = performance.now();
   log(`GET ${url}`);
 

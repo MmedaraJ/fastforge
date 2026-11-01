@@ -1,0 +1,12 @@
+# Build context hygiene. Everything here is either enormous, secret, or
+# irrelevant to compiling a Go binary — and the whole context is shipped to
+# the daemon on every build, so sending storage/ would mean uploading
+# gigabytes of video each time.
+.git/
+storage/
+tmp/
+pipeline/out/
+pipeline/sources/
+web/
+.env
+*.md
