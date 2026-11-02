@@ -2,3 +2,4 @@ pipeline/sources/
 pipeline/out/
 storage/
 .envtmp/
+tmp/

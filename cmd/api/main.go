@@ -76,6 +76,21 @@ type Rendition struct {
 	VMAF          *float64 `json:"vmaf"`
 }
 
+type beacon struct {
+	SessionID          string    `json:"sessionId"`
+	AssetID            string    `json:"assetId"`
+	StartedAt          time.Time `json:"startedAt"`
+	StartupMs          *int      `json:"startupMs"`
+	PlayingMs          int       `json:"playingMs"`
+	RebufferCount      int       `json:"rebufferCount"`
+	RebufferMs         int       `json:"rebufferMs"`
+	SwitchUpCount      int       `json:"switchUpCount"`
+	SwitchDownCount    int       `json:"switchDownCount"`
+	AverageBitrateKbps *int      `json:"averageBitrateKbps"`
+	DroppedFrames      int       `json:"droppedFrames"`
+	FatalError         *string   `json:"fatalError"`
+}
+
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -86,6 +101,45 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func makeCreateBeacon(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		// sendBeacon declares text/plain to stay a simple request, so
+		// Content-Type carries no information and isn't checked. The body IS
+		// capped: this endpoint is unauthenticated and reachable from any
+		// origin, and the one thing a telemetry sink must never do is trust
+		// the size of its input.
+		var b beacon
+		if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&b); err != nil {
+			http.Error(w, "bad beacon", http.StatusBadRequest)
+			return
+		}
+
+		_, err := pool.Exec(r.Context(), `
+			INSERT INTO playback_sessions
+			  (id, asset_id, started_at, startup_ms, playing_ms, rebuffer_count,
+			   rebuffer_ms, switch_up_count, switch_down_count,
+			   average_bitrate_kbps, dropped_frames, fatal_error, user_agent)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			ON CONFLICT (id) DO NOTHING`,
+			b.SessionID, b.AssetID, b.StartedAt, b.StartupMs, b.PlayingMs,
+			b.RebufferCount, b.RebufferMs, b.SwitchUpCount, b.SwitchDownCount,
+			b.AverageBitrateKbps, b.DroppedFrames, b.FatalError, r.UserAgent(),
+		)
+		if err != nil {
+			// Logged, not returned. A telemetry failure must never become a
+			// client-visible error — the measurement apparatus is not allowed
+			// to degrade the thing it measures.
+			log.Printf("beacon insert: %v", err)
+		}
+
+		// 204 and nothing else: the client is unloading. It cannot read a
+		// response and must not be kept waiting for one.
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func makeCreateAsset(pool *pgxpool.Pool, rc *river.Client[pgx.Tx]) http.HandlerFunc {
@@ -410,6 +464,7 @@ func main() {
 	r.Post("/assets", makeCreateAsset(pool, riverClient))
 	r.Get("/assets/{id}", makeGetAsset(pool, mediaBase))
 	r.With(withAPICORS).Get("/assets/{id}", makeGetAsset(pool, mediaBase))
+	r.With(withAPICORS).Post("/beacons", makeCreateBeacon(pool))
 	// Dev only. In production these bytes come from a CDN, and this route
 	// disappears. http.FileServer returns a Handler; StripPrefix wraps one
 	// and returns another; withMediaCORS wraps that. Three decorators,
