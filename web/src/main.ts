@@ -1,8 +1,10 @@
 import "./style.css";
 import { fetchAsset, manifestURL, play } from "./player";
 import type { Asset, Playback, PlayerEvent } from "./player";
-import { reportOnExit, sendBeacon } from "./beacon";
+import { reportOnExit, reportSession, sendBeacon } from "./beacon";
+import { runExperiment } from "./experiment";
 import type { QoESnapshot } from "./qoe";
+import { ALGORITHMS } from "./abr";
 
 const el = <T extends HTMLElement>(id: string): T =>
     document.getElementById(id) as T;
@@ -12,20 +14,37 @@ const levelSelect = el<HTMLSelectElement>("level");
 const loadButton = el<HTMLButtonElement>("load");
 const video = el<HTMLVideoElement>("v");
 const logPanel = el<HTMLDivElement>("log");
+const abrSelect = el<HTMLSelectElement>("abr");
+/**
+ * The network condition this tab is being tested under, from ?net=.
+ *
+ * The page has no way to see DevTools throttling. It runs in the network
+ * stack, not in anything JavaScript can read, so the condition has to be
+ * stated. Putting it in the URL means one bookmark per profile and no
+ * dropdown to forget to change. The measured throughput tile is how you check
+ * the label against reality.
+ */
+const networkProfile = new URLSearchParams(location.search).get("net");
+const roundsInput = el<HTMLInputElement>("rounds");
+const runButton = el<HTMLButtonElement>("run");
+const stopButton = el<HTMLButtonElement>("stop");
+const resultQuery = el<HTMLPreElement>("result-query");
 
+let running: AbortController | null = null;
 let playback: Playback | null = null;
 let currentHeight: number | null = null;
 let clockStart = 0;
 
-/**
- * Registered ONCE for the lifetime of the page, not per load.
- *
- * reportOnExit attaches pagehide and visibilitychange listeners. Calling it on
- * every load would stack a new pair each time, so one exit would fire a beacon
- * for every session ever played in this tab. The closure reads the CURRENT
- * playback when it fires, which is why a single registration covers them all.
- */
-reportOnExit(() => playback?.session.snapshot() ?? null);
+for (const name of Object.keys(ALGORITHMS)) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    abrSelect.append(option);
+}
+
+// During a run, the runner reports its own trials. A trial cut short by
+// closing the tab is incomplete, so it isn't reported.
+reportOnExit(() => (running ? null : playback?.session.snapshot() ?? null));
 
 // Debug handle. Page-lifecycle events vary by browser and OS, so being able to
 // fire a beacon on demand separates "is the transport working" from "did the
@@ -38,6 +57,81 @@ reportOnExit(() => playback?.session.snapshot() ?? null);
       return s;
   },
 };
+
+/**
+ * Report the current session, then tear it down. This is the bug fix: a
+ * session ends when you load another one, not only when the page closes, and
+ * every way a session can end has to report it.
+ */
+async function endCurrent(): Promise<void> {
+    const previous = playback;
+    playback = null;
+    if (!previous) return;
+    reportSession(previous.session.snapshot());
+    await previous.destroy();
+}
+
+function setRunning(active: boolean): void {
+    for (const control of [assetInput, abrSelect, levelSelect, loadButton, roundsInput, runButton]) {
+        control.disabled = active;
+    }
+    stopButton.disabled = !active;
+}
+
+async function startExperiment(): Promise<void> {
+    const assetId = assetInput.value.trim();
+    if (!assetId) return log("enter an asset id first", "er");
+    if (!networkProfile) {
+        return log("open the page with ?net=<label> first. Results only compare within one labelled network", "er");
+    }
+
+    await endCurrent();
+    logPanel.textContent = "";
+    resultQuery.hidden = true;
+    clockStart = 0;
+
+    running = new AbortController();
+    setRunning(true);
+
+    try {
+        const summary = await runExperiment(
+            {
+                assetId,
+                networkProfile,
+                algorithms: ALGORITHMS,
+                rounds: Math.max(1, Number(roundsInput.value) || 5),
+                signal: running.signal,
+            },
+            {
+                video,
+                log,
+                onEvent: onPlayerEvent,
+                onPlayback(p) {
+                    playback = p;
+                    currentHeight = null;
+                    levelSelect.length = 1;
+                    clockStart = p ? performance.now() : 0;
+                },
+            },
+        );
+
+        log(
+            `${summary.aborted ? "stopped" : "done"}: ${summary.recorded} recorded, ${summary.discarded} discarded` +
+                (summary.timedOut ? `, ${summary.timedOut} timed out` : ""),
+            "sw",
+        );
+        resultQuery.textContent = summary.command;
+        resultQuery.hidden = false;
+    } catch (error) {
+        log((error as Error).message, "er");
+    } finally {
+        running = null;
+        setRunning(false);
+    }
+}
+
+runButton.addEventListener("click", () => void startExperiment());
+stopButton.addEventListener("click", () => running?.abort());
 
 type LogKind = "" | "sw" | "er";
 
@@ -89,6 +183,7 @@ function render(s: QoESnapshot): void {
     set("ratio", `${(s.rebufferRatio * 100).toFixed(2)}%`,
         s.rebufferRatio === 0 ? "good" : s.rebufferRatio < 0.01 ? "warn" : "bad");
     set("dropped", String(s.droppedFrames));
+    set("tput", s.measuredThroughputKbps === null ? "—" : `${s.measuredThroughputKbps}k`);
 
     // Live state — what is true RIGHT NOW. Deliberately not from the snapshot:
     // "average bitrate over the session" and "the rung playing this instant"
@@ -135,8 +230,13 @@ function onPlayerEvent(event: PlayerEvent): void {
 }
 
 async function load(): Promise<void> {
-    playback?.destroy();
-    playback = null;
+    // A new load ENDS the previous session. The beacon only fires on page
+    // exit, so without this the outgoing QoESession is discarded the moment
+    // `playback` is reassigned — every session measured and then lost.
+    //
+    // This is also how a feed-style player behaves: swiping to the next item
+    // ends one session and begins another, with no page navigation anywhere.
+    await endCurrent();
     currentHeight = null;
     clockStart = 0;
     logPanel.textContent = "";
@@ -169,7 +269,19 @@ async function load(): Promise<void> {
     clockStart = performance.now();
     log(`GET ${url}`);
 
-    playback = play(video, asset, url, onPlayerEvent);
+    if (networkProfile) {
+        log(`network profile: ${networkProfile}`);
+    } else {
+        log("no ?net= label: this session won't appear in the comparison", "er");
+    }
+
+    playback = play(video, {
+        asset,
+        url,
+        abr: ALGORITHMS[abrSelect.value],
+        networkProfile,
+        onEvent: onPlayerEvent,
+    });
 }
 
 // snapshot() closes the open interval and immediately reopens it, so polling it

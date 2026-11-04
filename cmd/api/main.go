@@ -77,18 +77,21 @@ type Rendition struct {
 }
 
 type beacon struct {
-	SessionID          string    `json:"sessionId"`
-	AssetID            string    `json:"assetId"`
-	StartedAt          time.Time `json:"startedAt"`
-	StartupMs          *int      `json:"startupMs"`
-	PlayingMs          int       `json:"playingMs"`
-	RebufferCount      int       `json:"rebufferCount"`
-	RebufferMs         int       `json:"rebufferMs"`
-	SwitchUpCount      int       `json:"switchUpCount"`
-	SwitchDownCount    int       `json:"switchDownCount"`
-	AverageBitrateKbps *int      `json:"averageBitrateKbps"`
-	DroppedFrames      int       `json:"droppedFrames"`
-	FatalError         *string   `json:"fatalError"`
+	SessionID              string    `json:"sessionId"`
+	AssetID                string    `json:"assetId"`
+	StartedAt              time.Time `json:"startedAt"`
+	StartupMs              *int      `json:"startupMs"`
+	PlayingMs              int       `json:"playingMs"`
+	RebufferCount          int       `json:"rebufferCount"`
+	RebufferMs             int       `json:"rebufferMs"`
+	SwitchUpCount          int       `json:"switchUpCount"`
+	SwitchDownCount        int       `json:"switchDownCount"`
+	AverageBitrateKbps     *int      `json:"averageBitrateKbps"`
+	DroppedFrames          int       `json:"droppedFrames"`
+	AbrAlgorithm           string    `json:"abrAlgorithm"`
+	NetworkProfile         *string   `json:"networkProfile"`
+	MeasuredThroughputKbps *int      `json:"measuredThroughputKbps"`
+	FatalError             *string   `json:"fatalError"`
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
@@ -120,14 +123,14 @@ func makeCreateBeacon(pool *pgxpool.Pool) http.HandlerFunc {
 
 		_, err := pool.Exec(r.Context(), `
 			INSERT INTO playback_sessions
-			  (id, asset_id, started_at, startup_ms, playing_ms, rebuffer_count,
-			   rebuffer_ms, switch_up_count, switch_down_count,
-			   average_bitrate_kbps, dropped_frames, fatal_error, user_agent)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			  (id, asset_id, started_at, startup_ms, playing_ms, rebuffer_count, rebuffer_ms, switch_up_count, 
+			  switch_down_count, average_bitrate_kbps, dropped_frames, abr_algorithm, network_profile, 
+			  measured_throughput_kbps, fatal_error, user_agent)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 			ON CONFLICT (id) DO NOTHING`,
-			b.SessionID, b.AssetID, b.StartedAt, b.StartupMs, b.PlayingMs,
-			b.RebufferCount, b.RebufferMs, b.SwitchUpCount, b.SwitchDownCount,
-			b.AverageBitrateKbps, b.DroppedFrames, b.FatalError, r.UserAgent(),
+			b.SessionID, b.AssetID, b.StartedAt, b.StartupMs, b.PlayingMs, b.RebufferCount, b.RebufferMs, b.SwitchUpCount,
+			b.SwitchDownCount, b.AverageBitrateKbps, b.DroppedFrames, b.AbrAlgorithm, b.NetworkProfile,
+			b.MeasuredThroughputKbps, b.FatalError, r.UserAgent(),
 		)
 		if err != nil {
 			// Logged, not returned. A telemetry failure must never become a

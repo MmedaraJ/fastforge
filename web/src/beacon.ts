@@ -14,45 +14,40 @@ import { API_URL } from "./config";
  * for a round trip. The server parses JSON regardless of the declared type.
  * The constraint is page lifecycle; the content type is the consequence.
  */
-export function sendBeacon(snapshot: QoESnapshot): void {
+export function sendBeacon(snapshot: QoESnapshot): boolean {
     const body = new Blob([JSON.stringify(snapshot)], { type: "text/plain" });
-    const queued = navigator.sendBeacon(`${API_URL}/beacons`, body);
-    if (!queued) console.warn("beacon not queued — payload too large, or page already gone");
+    return navigator.sendBeacon(`${API_URL}/beacons`, body);
+}
+
+/**
+ * Ids of sessions already sent. A session can now be reported from several
+ * places (the runner, loading a new asset, the page closing), so this makes a
+ * second report of the same session a no-op on the client. ON CONFLICT DO
+ * NOTHING does the same on the server.
+ *
+ * This replaces the old `sent` flag, which allowed one beacon per PAGE. The
+ * rule that matters is one beacon per SESSION.
+ */
+const reported = new Set<string>();
+
+export function reportSession(snapshot: QoESnapshot): boolean {
+    if (reported.has(snapshot.sessionId)) return true;
+    const queued = sendBeacon(snapshot);
+    // Only remember it if the browser accepted it, so a refused beacon can be
+    // tried again.
+    if (queued) reported.add(snapshot.sessionId);
+    return queued;
 }
 
 export function reportOnExit(get: () => QoESnapshot | null): void {
-    let sent = false;
-
-    // `why` exists only so the console can tell you which of the two triggers
-    // fired — or that neither did. Page-lifecycle events differ by browser and
-    // OS, and "nothing arrived" looks identical whether the listener never ran
-    // or the request failed.
     const fire = (why: string) => {
-        if (sent) return console.log(`[beacon] ${why} — already sent`);
         const s = get();
-        if (!s) return console.log(`[beacon] ${why} — no session yet`);
-        sent = true;
-        console.log(`[beacon] ${why} — queued=${sendBeacon(s)}`);
+        if (!s) return console.debug(`[beacon] ${why}: no session`);
+        console.debug(`[beacon] ${why}: queued=${reportSession(s)}`);
     };
 
-    // Logged at three points, because "nothing arrived" has three different
-    // causes that look identical from the outside: the module never ran, the
-    // event never fired, or the event fired in a state we ignore. Each line
-    // below rules one of them out.
-    console.log("[beacon] exit reporting armed");
-
-    // pagehide, not unload: unload is unreliable on mobile and disqualifies the
-    // page from the back/forward cache.
-    window.addEventListener("pagehide", () => {
-        console.log("[beacon] pagehide");
-        fire("pagehide");
-    });
-
-    // Logged for EVERY visibilitychange, not only the hidden ones — otherwise
-    // an event that fires with state "visible" is indistinguishable from no
-    // event at all.
+    window.addEventListener("pagehide", () => fire("pagehide"));
     document.addEventListener("visibilitychange", () => {
-        console.log(`[beacon] visibilitychange -> ${document.visibilityState}`);
         if (document.visibilityState === "hidden") fire("visibilitychange");
     });
 }

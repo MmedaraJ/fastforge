@@ -12,7 +12,14 @@
       <div class="bar">
         <input id="asset" placeholder="asset id" spellcheck="false" autocomplete="off" />
         <select id="level"><option value="-1">auto</option></select>
+        <select id="abr"></select>
         <button id="load" type="button">load</button>
+      </div>
+
+      <div class="bar">
+        <label class="inline">rounds <input id="rounds" type="number" min="1" max="20" value="5" /></label>
+        <button id="run" type="button">run experiment</button>
+        <button id="stop" type="button" disabled>stop</button>
       </div>
 
       <video id="v" controls muted playsinline></video>
@@ -26,9 +33,11 @@
         <div class="stat"><div class="k">rebuffers</div><div class="v" id="rebuffers">0</div></div>
         <div class="stat"><div class="k">rebuffer %</div><div class="v" id="ratio">0.00</div></div>
         <div class="stat"><div class="k">dropped</div><div class="v" id="dropped">0</div></div>
+        <div class="stat"><div class="k">throughput</div><div class="v" id="tput">—</div></div>
       </div>
 
       <div id="log"></div>
+      <pre id="result-query" hidden></pre>
 
       <p class="hint">
         Throttle in DevTools &rarr; Network with <strong>Disable cache</strong> ticked.

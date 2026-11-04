@@ -36,9 +36,21 @@ export interface QoESnapshot {
   switchDownCount: number;
   switchCount: number;
 
+  networkProfile: string | null;
+  measuredThroughputKbps: number | null;
+
   averageBitrateKbps: number | null;
   droppedFrames: number;
+  abrAlgorithm: string;
   fatalError: string | null;
+}
+
+/** Who and what this session was. Named fields, so they can't be swapped silently. */
+export interface SessionContext {
+    assetId: string;
+    abrAlgorithm: string;
+    /** The ?net= label, or null if the tab wasn't given one. */
+    networkProfile: string | null;
 }
 
 const ZERO: Record<PlayerState, number> = {
@@ -76,10 +88,20 @@ export class QoESession {
     private droppedFrames = 0;
     private fatalError: string | null = null;
   
-    readonly assetId: string;
+    private startupValid = true;
 
-    constructor(assetId: string) {
-        this.assetId = assetId;
+    // Total video bytes and total time spent downloading them. Dividing one by
+    // the other at the end gives the link's average speed. It's a ratio of
+    // sums, so a large slow segment counts for more than a tiny fast one.
+    // Idle time between downloads is excluded, so this measures the network's
+    // speed rather than how fast the video was consumed.
+    private downloadedBytes = 0;
+    private downloadSeconds = 0;
+
+    readonly context: SessionContext;
+
+    constructor(context: SessionContext) {
+        this.context = context;
     }
 
     /**
@@ -107,6 +129,11 @@ export class QoESession {
 
     private get terminal(): boolean {
         return this.state === "ended" || this.state === "failed";
+    }
+
+    /** True once playback has reached the end of the content. */
+    get hasEnded(): boolean {
+        return this.state === "ended";
     }
 
     /** The viewer's clock starts at the manifest request. */
@@ -180,6 +207,27 @@ export class QoESession {
         this.droppedFrames = Math.max(0, elementTotal - this.droppedFramesBaseline);
     }
 
+    /**
+     * A startup time only describes the viewer's experience if the viewer was
+     * there to experience it. If the tab is hidden before the first frame,
+     * the browser may hold playback until it's visible again, and the clock
+     * would measure how long someone was away rather than how fast the stream
+     * started.
+     *
+     * Invalid is not the same as zero or as slow. The snapshot reports null,
+     * and percentile_disc ignores nulls, so the session drops out of startup
+     * statistics while its other metrics still count.
+     */
+    hiddenBeforeStart(): void {
+        if (this.startupMs === null) this.startupValid = false;
+    }
+
+    recordDownload(bytes: number, seconds: number): void {
+        if (seconds <= 0 || bytes <= 0) return;
+        this.downloadedBytes += bytes;
+        this.downloadSeconds += seconds;
+    }
+
     /** Not pure: it closes the open interval first, which it must. */
     snapshot(now = performance.now()): QoESnapshot {
         this.accrue(now);
@@ -190,9 +238,9 @@ export class QoESession {
 
         return {
             sessionId: this.sessionId,
-            assetId: this.assetId,
+            assetId: this.context.assetId,
             startedAt: this.startedAt,
-            startupMs: this.startupMs === null ? null : Math.round(this.startupMs),
+            startupMs: this.startupMs === null || !this.startupValid ? null : Math.round(this.startupMs),
             playingMs: Math.round(playingMs),
             rebufferCount: this.rebufferCount,
             rebufferMs: Math.round(rebufferMs),
@@ -210,6 +258,12 @@ export class QoESession {
             averageBitrateKbps: playingMs === 0 ? null : Math.round(this.bitrateIntegral / playingMs),
 
             droppedFrames: this.droppedFrames,
+            abrAlgorithm: this.context.abrAlgorithm,
+            networkProfile: this.context.networkProfile,
+            measuredThroughputKbps:
+                this.downloadSeconds === 0
+                    ? null
+                    : Math.round((this.downloadedBytes * 8) / 1000 / this.downloadSeconds),
             fatalError: this.fatalError,
         };
     }
