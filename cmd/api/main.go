@@ -91,6 +91,8 @@ type beacon struct {
 	AbrAlgorithm           string    `json:"abrAlgorithm"`
 	NetworkProfile         *string   `json:"networkProfile"`
 	MeasuredThroughputKbps *int      `json:"measuredThroughputKbps"`
+	Engine                 *string   `json:"engine"`
+	Protocol               *string   `json:"protocol"`
 	FatalError             *string   `json:"fatalError"`
 }
 
@@ -125,12 +127,12 @@ func makeCreateBeacon(pool *pgxpool.Pool) http.HandlerFunc {
 			INSERT INTO playback_sessions
 			  (id, asset_id, started_at, startup_ms, playing_ms, rebuffer_count, rebuffer_ms, switch_up_count, 
 			  switch_down_count, average_bitrate_kbps, dropped_frames, abr_algorithm, network_profile, 
-			  measured_throughput_kbps, fatal_error, user_agent)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+			  measured_throughput_kbps, fatal_error, user_agent, engine, protocol)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 			ON CONFLICT (id) DO NOTHING`,
 			b.SessionID, b.AssetID, b.StartedAt, b.StartupMs, b.PlayingMs, b.RebufferCount, b.RebufferMs, b.SwitchUpCount,
 			b.SwitchDownCount, b.AverageBitrateKbps, b.DroppedFrames, b.AbrAlgorithm, b.NetworkProfile,
-			b.MeasuredThroughputKbps, b.FatalError, r.UserAgent(),
+			b.MeasuredThroughputKbps, b.FatalError, r.UserAgent(), b.Engine, b.Protocol,
 		)
 		if err != nil {
 			// Logged, not returned. A telemetry failure must never become a

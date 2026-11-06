@@ -1,8 +1,15 @@
-import Hls from "hls.js";
-import { QoESession } from "./qoe";
-import { API_URL } from "./config";
 import type { AbrAlgorithm } from "./abr";
 import { ThroughputEstimator } from "./abr/ewma";
+import { API_URL } from "./config";
+import { CAN_SELECT_LEVEL, createEngine, playsHlsNatively, resolveEngine } from "./engines";
+import type { EngineName, LevelInfo, Protocol } from "./engines/types";
+import { QoESession } from "./qoe";
+
+// Re-exported so abr/types.ts, main.ts and experiment.ts keep importing from
+// here. This file is the only door into the player; nothing outside it
+// reaches into src/engines/.
+export type { EngineName, LevelInfo, Protocol };
+export { CAN_SELECT_LEVEL, playsHlsNatively };
 
 export interface Rendition {
   height: number;
@@ -25,24 +32,21 @@ export interface Asset {
 }
 
 /**
- * What the view is told about. Deliberately NOT hls.js's event shapes —
- * main.ts must never import Hls, or swapping in Shaka Player later would mean
- * rewriting the UI as well as this file.
+ * What the view is told about. Deliberately NOT any library's event shapes.
+ * main.ts never imports hls.js or Shaka, which is why adding engines hasn't
+ * meant rewriting the UI.
  */
 export type PlayerEvent =
     | { type: "manifest"; levels: LevelInfo[]; audioTracks: number }
     | { type: "switch"; index: number; height: number; bitrateKbps: number }
     | { type: "error"; detail: string; fatal: boolean };
 
-export interface LevelInfo {
-    index: number;
-    height: number;
-    bitrateKbps: number;
-}
-
 export interface PlayOptions {
     asset: Asset;
     url: string;
+    /** The engine asked for. May be swapped for "native"; see resolveEngine. */
+    engine: EngineName;
+    protocol: Protocol;
     abr: AbrAlgorithm;
     /** Label for the network conditions, e.g. "2500k". Null if unlabelled. */
     networkProfile: string | null;
@@ -55,19 +59,24 @@ export async function fetchAsset(id: string): Promise<Asset> {
     return res.json() as Promise<Asset>;
 }
 
-// The API owns where media lives — it builds hls_url from MEDIA_BASE_URL. The
-// player asks rather than reconstructing the URL, so moving to a CDN is a
+// The API owns where media lives: it builds both URLs from MEDIA_BASE_URL. The
+// player asks rather than reconstructing them, so moving to a CDN is a
 // server-side config change this file never learns about.
-export function manifestURL(asset: Asset): string {
-    if (!asset.hls_url) throw new Error(`no hls_url — status is "${asset.status}"`);
-    return asset.hls_url.startsWith("http") ? asset.hls_url : API_URL + asset.hls_url;
+export function manifestURL(asset: Asset, protocol: Protocol): string {
+    const path = protocol === "dash" ? asset.dash_url : asset.hls_url;
+    if (!path) throw new Error(`no ${protocol} manifest; status is "${asset.status}"`);
+    return path.startsWith("http") ? path : API_URL + path;
 }
 
 export interface Playback {
     session: QoESession;
+    /** The engine actually running, which can differ from the one asked for. */
+    engine: EngineName;
+    /** False when the engine picks renditions itself and can't be overruled. */
+    canSelectLevel: boolean;
     /** -1 restores automatic selection. */
     setLevel(index: number): void;
-    destroy(): void;
+    destroy(): Promise<void>;
 }
 
 // Must match ladder.SegmentSeconds on the server. BOLA reasons in segments
@@ -113,26 +122,42 @@ function reachedEnd(video: HTMLVideoElement): boolean {
 }
 
 export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
-    const { asset, url, abr, networkProfile, onEvent = () => {} } = options;
+    const { asset, url, protocol, abr, networkProfile, onEvent = () => {} } = options;
 
-    // The algorithm's name travels with the session so the beacon can say which
-    // arm produced this row. A comparison you cannot attribute is not a
-    // comparison. (Needs the second constructor parameter in qoe.ts.)
+    // Settle which engine really runs before anything else, because the rest
+    // depends on it: whether your ABR can run, and what the session records.
+    const engineName = resolveEngine(options.engine, protocol, video);
+    const canSelectLevel = CAN_SELECT_LEVEL[engineName];
+    const ownAbr = canSelectLevel && !abr.deferToEngine;
+
     const session = new QoESession({
         assetId: asset.asset_id,
-        abrAlgorithm: abr.name,
+        // Record who actually chose the renditions. On an engine that can't be
+        // overruled, that was the engine, whatever the ABR dropdown said.
+        // Recording the dropdown would file sessions your algorithm never
+        // touched under its name. (The old native fallback did exactly that:
+        // it recorded abr.name, then never ran the algorithm.)
+        abrAlgorithm: ownAbr ? abr.name : "engine-default",
         networkProfile,
+        // The engine that ran, not the one requested, for the same reason.
+        engine: engineName,
+        protocol,
     });
 
     const throughput = new ThroughputEstimator();
     let levels: LevelInfo[] = [];
+    // Tracked here rather than asked of the engine: every engine reports
+    // switches through onSwitch, but they don't all have a "current level"
+    // property to read.
+    let currentLevel = -1;
 
     const on = <K extends keyof HTMLVideoElementEventMap>(type: K, fn: () => void) => {
         video.addEventListener(type, fn);
         return () => video.removeEventListener(type, fn);
     };
 
-    // Playback events — these work on every path, including native HLS.
+    // Playback events: standard <video> events, the same for every engine,
+    // native included. That's why they stay in this file.
     const off = [
         on("playing", () => session.resumed()),
         on("waiting", () => {
@@ -160,76 +185,6 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
     document.addEventListener("visibilitychange", onVisibility);
     off.push(() => document.removeEventListener("visibilitychange", onVisibility));
 
-    let hls: Hls | null = null;
-
-    if (Hls.isSupported()) {
-        hls = new Hls();
-
-        hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-            // Assigned, not inlined: decide() reads this at every tick, long
-            // after this handler has returned.
-            levels = data.levels.map((l, index) => ({
-                index,
-                height: l.height,
-                bitrateKbps: Math.round(l.bitrate / 1000),
-            }));
-            onEvent({
-                type: "manifest",
-                levels,
-                // data.audioTracks, not hls.audioTracks: the property is filled
-                // by hls.js's own listener on this same event, and listener
-                // order is not guaranteed.
-                audioTracks: data.audioTracks?.length ?? 0,
-            });
-        });
-
-        hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
-            const level = hls!.levels[data.level];
-            const bitrateKbps = Math.round(level.bitrate / 1000);
-            session.levelChanged(data.level, bitrateKbps);
-            onEvent({ type: "switch", index: data.level, height: level.height, bitrateKbps });
-        });
-
-        hls.on(Hls.Events.ERROR, (_, data) => {
-            onEvent({ type: "error", detail: `${data.type}/${data.details}`, fatal: data.fatal });
-            if (data.fatal) session.failed(`${data.type}/${data.details}`);
-        });
-
-        // NEW — every completed fragment is one observation of the network.
-        //
-        // We compute our own estimate rather than reading hls.bandwidthEstimate:
-        // borrowing their estimator would turn the milestone into a comparison
-        // of two selection rules over one shared estimator, which is a
-        // different and narrower experiment.
-        hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
-            // Video media segments only. Audio segments (~96 KB) and init segments
-            // (~1 KB) are small enough that their timing is mostly round-trip
-            // latency, so they understate the link's speed.
-            // frag.type is a hls.js enum; casting to string compares its value
-            // without importing the enum.
-            if ((data.frag.type as string) !== "main") return;
-            if (data.frag.sn === "initSegment") return;
-
-            const stats = data.frag.stats;
-            const seconds = (stats.loading.end - stats.loading.start) / 1000;
-
-            throughput.record(stats.total, seconds);
-            session.recordDownload(stats.total, seconds);
-
-            decide();
-        });
-
-        session.requestStarted();
-        hls.loadSource(url);
-        hls.attachMedia(video);
-    } else {
-        // Safari plays HLS natively. No level events exist here, so switch and
-        // bitrate metrics stay empty — and your custom ABR does not run at all,
-        // because there is nothing to write nextAutoLevel on.
-        session.requestStarted();
-        video.src = url;
-    }
-
     // Seconds of media ahead of the playhead. Buffer-based algorithms are
     // entirely a function of this number, so it is worth being exact: find the
     // buffered range CONTAINING the playhead, not simply the last one. A gap
@@ -244,34 +199,121 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
         return 0;
     }
 
-    // Declared with `function`, so it is hoisted and the FRAG_LOADED handler
-    // above can call it even though it is written below.
+    // decide() and the callbacks below use `engine`, which is declared
+    // further down. That's safe only because none of them runs until later
+    // (after a download, on the 500 ms tick, or once the manifest is read), by
+    // which time `engine` exists. Reading a `const` before its line has run
+    // throws a ReferenceError.
     function decide(): void {
-        if (!hls || levels.length === 0) return;
+        if (!ownAbr || levels.length === 0) return;
 
-        // autoLevelEnabled is false once the viewer pins a rung in the
-        // dropdown. An explicit choice outranks any algorithm — override it and
-        // the manual control silently stops working, which is worse than having
-        // no control at all.
-        if (!hls.autoLevelEnabled) return;
+        // autoEnabled is false once the viewer pins a rung in the dropdown. An
+        // explicit choice outranks any algorithm — override it and the manual
+        // control silently stops working, which is worse than having no
+        // control at all.
+        if (!engine.autoEnabled) return;
 
         const next = abr.choose({
             levels,
-            currentLevel: hls.currentLevel,
+            currentLevel,
             bufferSeconds: bufferedAhead(),
             throughputKbps: throughput.kbps,
             segmentSeconds: SEGMENT_SECONDS,
             playbackRate: Math.abs(video.playbackRate) || 1,
         });
-
-        // -1 means defer to hls.js. Writing -1 to nextAutoLevel would ALSO mean
-        // auto, so this is harmless either way — but returning early leaves the
-        // control arm genuinely untouched rather than coincidentally equivalent.
         if (next < 0) return;
-        hls.nextAutoLevel = next;
+        engine.requestLevel(next);
     }
 
-    void video.play().catch(() => {});
+    // Delivery events: each engine translates its own library's events into
+    // these four callbacks. This object is the only thing player.ts knows
+    // about engines.
+    const engine = createEngine(engineName, video, {
+        ownAbr,
+
+        onManifest(found, audioTracks) {
+            // Assigned, not inlined: decide() reads this at every tick, long
+            // after this callback has returned.
+            levels = found;
+            onEvent({ type: "manifest", levels, audioTracks });
+
+            // The opening level. When your algorithm is in charge it makes
+            // this choice too, with what's known at this moment: an empty
+            // buffer and no measurement. Both of yours answer 0 then ("start
+            // at the bottom"). Asking here is what makes the opening the same
+            // on every engine. In Milestone 9 nothing asked, so the first
+            // segment was whatever hls.js chose. -1 lets the engine choose.
+            const opening = ownAbr
+                ? abr.choose({
+                      levels,
+                      currentLevel: -1,
+                      bufferSeconds: 0,
+                      throughputKbps: throughput.kbps,
+                      segmentSeconds: SEGMENT_SECONDS,
+                      playbackRate: Math.abs(video.playbackRate) || 1,
+                  })
+                : -1;
+
+            // Required by the Engine contract: start() is called before this
+            // callback returns. See EngineCallbacks.onManifest for why.
+            engine.start(opening);
+        },
+
+        onSwitch(index) {
+            currentLevel = index;
+            const level = levels[index];
+            if (!level) return;
+            session.levelChanged(index, level.bitrateKbps);
+            onEvent({ type: "switch", index, height: level.height, bitrateKbps: level.bitrateKbps });
+        },
+
+        // Every completed video segment is one observation of the network. We
+        // keep our own estimate rather than borrowing an engine's: that keeps
+        // the comparison about selection rules, over one shared estimator.
+        onDownload(bytes, seconds) {
+            throughput.record(bytes, seconds);
+            session.recordDownload(bytes, seconds);
+            decide();
+        },
+
+        onError(detail, fatal) {
+            onEvent({ type: "error", detail, fatal });
+            if (fatal) session.failed(detail);
+        },
+    });
+
+    // Set by destroy(). Anything that finishes after that belongs to a
+    // session that's already over, and must not touch the <video>, which by
+    // then belongs to the next session.
+    let destroyed = false;
+
+    session.requestStarted();
+    engine.load(url).then(
+        // Ask to play only once the engine has given the <video> a source.
+        // hls.js attaches immediately, so calling play() straight away used to
+        // work. Shaka attaches asynchronously: when its source arrives, the
+        // browser treats it as a new load, cancels the pending play() ("The
+        // play() request was interrupted by a new load request"), and the
+        // video sits paused.
+        () => {
+            if (destroyed) return;
+            video.play().catch((error: unknown) => {
+                if (destroyed) return;
+                // Usually the browser's autoplay policy. Not fatal, since the
+                // viewer can press play, but no longer swallowed silently.
+                const detail = error instanceof Error ? error.message : String(error);
+                onEvent({ type: "error", detail: `play() refused: ${detail}`, fatal: false });
+            });
+        },
+        (error: unknown) => {
+            // Tearing an engine down mid-load makes its load fail (Shaka calls
+            // it LOAD_INTERRUPTED). That's not a playback failure.
+            if (destroyed) return;
+            const detail = error instanceof Error ? error.message : String(error);
+            onEvent({ type: "error", detail, fatal: true });
+            session.failed(detail);
+        },
+    );
 
     // Dropped frames have no event; the only way to get them is to ask.
     const poll = window.setInterval(() => {
@@ -279,10 +321,10 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
         if (q) session.recordDroppedFrames(q.droppedVideoFrames);
     }, 1000);
 
-    // Fragment events only fire when something downloads. Buffer level changes
-    // continuously as playback drains it, so a buffer-based algorithm needs its
-    // own clock — otherwise it can only react when a segment arrives, which is
-    // exactly the moment it is least able to help.
+    // Download callbacks only fire when something downloads. Buffer level
+    // changes continuously as playback drains it, so a buffer-based algorithm
+    // needs its own clock — otherwise it can only react when a segment
+    // arrives, which is exactly the moment it is least able to help.
     const abrTick = window.setInterval(decide, 500);
 
     // `waiting` isn't guaranteed to fire at the end either, so also check on a
@@ -297,15 +339,18 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
 
     return {
         session,
-        setLevel(index: number) {
-            if (hls) hls.currentLevel = index;
-        },
-        destroy() {
+        engine: engineName,
+        canSelectLevel,
+        setLevel: (index) => engine.setLevel(index),
+        async destroy() {
+            destroyed = true;
             window.clearInterval(poll);
             window.clearInterval(abrTick);   // or it ticks forever
             window.clearInterval(endWatch);
             off.forEach((f) => f());
-            hls?.destroy();
+            // Awaited: the next engine must not attach to this <video> until
+            // this one has let go of it.
+            await engine.destroy();
         },
     };
 }

@@ -21,13 +21,16 @@
 import type { AbrAlgorithm } from "./abr";
 import { reportSession } from "./beacon";
 import { fetchAsset, manifestURL, play } from "./player";
-import type { Asset, Playback, PlayerEvent } from "./player";
+import type { Asset, EngineName, Playback, PlayerEvent, Protocol } from "./player";
 import type { QoESnapshot } from "./qoe";
 
 export interface ExperimentConfig {
     assetId: string;
     /** The ?net= label. Every recorded trial carries it. */
     networkProfile: string;
+    /** Every trial in a run uses this engine. Engines are compared across runs. */
+    engine: EngineName;
+    protocol: Protocol;
     algorithms: Record<string, AbrAlgorithm>;
     /** Sessions per algorithm. */
     rounds: number;
@@ -62,6 +65,8 @@ interface TrialContext {
     asset: Asset;
     url: string;
     networkProfile: string;
+    engine: EngineName;
+    protocol: Protocol;
     timeoutMs: number;
     hooks: ExperimentHooks;
     signal: AbortSignal;
@@ -89,8 +94,10 @@ export async function runExperiment(
     const asset = await fetchAsset(config.assetId);
     const ctx: TrialContext = {
         asset,
-        url: manifestURL(asset),
         networkProfile,
+        url: manifestURL(asset, config.protocol),
+        engine: config.engine,
+        protocol: config.protocol,
         // Long enough for a slow network to finish with heavy rebuffering,
         // short enough that a stuck session doesn't hold up the whole run.
         timeoutMs: ((asset.duration_s ?? 60) * 5 + 60) * 1000,
@@ -102,16 +109,13 @@ export async function runExperiment(
     const plan: string[] = [];
     for (let round = 0; round < config.rounds; round++) plan.push(...shuffled(names));
 
-    log(`plan: ${config.rounds} rounds × ${names.length} algorithms = ${plan.length} trials on "${networkProfile}"`);
+    log(`plan: ${config.rounds} rounds × ${names.length} algorithms = ${plan.length} trials on "${networkProfile}" with ${config.engine} · ${config.protocol}`);
     log(`order: ${plan.join(", ")}`);
 
-    // Warm-up, not recorded. Three purposes:
+    // Warm-up, not recorded. Two purposes:
     //  - It loads this asset into the CDN's edge cache, so recorded trials all
     //    see the same CDN state, instead of the first one paying for fetches
     //    from R2.
-    //  - It saves a throughput prior measured on THIS network, so
-    //    throughput-seeded's first trial doesn't open using a number left
-    //    over from a different test.
     //  - It checks your setup before the run starts. If the cache is on or
     //    the throttle doesn't match the label, you find out in the first
     //    minute, not after fifteen.
@@ -180,6 +184,8 @@ async function runTrial(ctx: TrialContext, algorithm: AbrAlgorithm, label: strin
     const playback = play(video, {
         asset: ctx.asset,
         url: ctx.url,
+        engine: ctx.engine,
+        protocol: ctx.protocol,
         abr: algorithm,
         networkProfile: label,
         onEvent: ctx.hooks.onEvent,
@@ -345,7 +351,7 @@ function logResult(s: QoESnapshot, log: ExperimentHooks["log"]): void {
 function resultsCommand(profile: string, since: string): string {
     const label = profile.replace(/'/g, "''");
     const sql = [
-        "SELECT abr_algorithm, count(*) AS sessions,",
+        "SELECT engine, protocol, abr_algorithm, count(*) AS sessions,",
         "percentile_disc(0.5) WITHIN GROUP (ORDER BY startup_ms) AS p50_startup,",
         "percentile_disc(0.95) WITHIN GROUP (ORDER BY startup_ms) AS p95_startup,",
         "round(100.0 * sum(rebuffer_ms) / nullif(sum(playing_ms + rebuffer_ms), 0), 2) AS rebuffer_pct,",
@@ -353,7 +359,7 @@ function resultsCommand(profile: string, since: string): string {
         "percentile_disc(0.5) WITHIN GROUP (ORDER BY measured_throughput_kbps) AS net_kbps,",
         "round(avg(switch_up_count + switch_down_count), 1) AS avg_switches",
         `FROM playback_sessions WHERE network_profile = '${label}' AND created_at >= '${since}'`,
-        "GROUP BY abr_algorithm ORDER BY abr_algorithm;",
+        "GROUP BY engine, protocol, abr_algorithm ORDER BY engine, protocol, abr_algorithm;",
     ].join(" ");
     return `docker compose exec -T db psql -U fastforge -c "${sql}"`;
 }

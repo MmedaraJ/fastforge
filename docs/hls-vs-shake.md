@@ -1,0 +1,3 @@
+hls.js: you set values on it. When you want a different rung, you write hls.nextAutoLevel = 2. Its own ABR keeps running, and your setting overrides its choice.
+
+Shaka: it calls your code. You give it an object that follows its AbrManager interface. Shaka calls chooseVariant() when it needs a decision and passes you each download. If you want to change rung yourself, you call a function it handed you.

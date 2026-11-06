@@ -33,7 +33,7 @@ type Input struct {
 // plus one for the shared audio track. audioPath may be empty for a source
 // with no audio at all.
 func Args(video []Input, audioPath, outDir string, segmentSeconds int) []string {
-	args := make([]string, 0, len(video)+7)
+	args := make([]string, 0, len(video)+8)
 
 	for _, in := range video {
 		dir := fmt.Sprintf("%dp", in.Height)
@@ -61,6 +61,11 @@ func Args(video []Input, audioPath, outDir string, segmentSeconds int) []string 
 
 	args = append(args,
 		"--segment_duration", strconv.Itoa(segmentSeconds),
+		// Segment templates are DASH's live profile, so without this flag
+		// Shaka Packager writes a live MPD (type="dynamic"). DASH players then
+		// treat the asset as live and start near the live edge: the end of
+		// the clip. HLS is unaffected; its playlists already say VOD.
+		"--generate_static_live_mpd",
 		"--mpd_output", filepath.Join(outDir, DASHManifest),
 		"--hls_master_playlist_output", filepath.Join(outDir, HLSManifest),
 	)

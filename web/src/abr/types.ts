@@ -23,6 +23,8 @@ export interface AbrInput {
 
 export interface AbrAlgorithm {
     readonly name: string;
+    /** True for the control arm: let the engine's built-in ABR decide. */
+    readonly deferToEngine?: boolean;
     /** Returns a level index, or -1 to defer to the player's built-in ABR. */
     choose(input: AbrInput): number;
 }

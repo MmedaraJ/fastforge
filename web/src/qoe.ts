@@ -42,6 +42,10 @@ export interface QoESnapshot {
   averageBitrateKbps: number | null;
   droppedFrames: number;
   abrAlgorithm: string;
+
+  engine: string;
+  protocol: string;
+
   fatalError: string | null;
 }
 
@@ -51,6 +55,8 @@ export interface SessionContext {
     abrAlgorithm: string;
     /** The ?net= label, or null if the tab wasn't given one. */
     networkProfile: string | null;
+    engine: string;
+    protocol: string;
 }
 
 const ZERO: Record<PlayerState, number> = {
@@ -264,6 +270,10 @@ export class QoESession {
                 this.downloadSeconds === 0
                     ? null
                     : Math.round((this.downloadedBytes * 8) / 1000 / this.downloadSeconds),
+
+            engine: this.context.engine,
+            protocol: this.context.protocol,
+            
             fatalError: this.fatalError,
         };
     }

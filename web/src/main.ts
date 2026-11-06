@@ -1,6 +1,6 @@
 import "./style.css";
-import { fetchAsset, manifestURL, play } from "./player";
-import type { Asset, Playback, PlayerEvent } from "./player";
+import { CAN_SELECT_LEVEL, fetchAsset, manifestURL, play, playsHlsNatively } from "./player";
+import type { Asset, EngineName, Playback, PlayerEvent, Protocol } from "./player";
 import { reportOnExit, reportSession, sendBeacon } from "./beacon";
 import { runExperiment } from "./experiment";
 import type { QoESnapshot } from "./qoe";
@@ -34,6 +34,35 @@ let running: AbortController | null = null;
 let playback: Playback | null = null;
 let currentHeight: number | null = null;
 let clockStart = 0;
+
+const engineSelect = el<HTMLSelectElement>("engine");
+
+// Engine and protocol are picked together, as one option. hls.js can't play
+// DASH, so offering the two as separate dropdowns would let someone select a
+// combination the code can't run. If the UI can only offer valid
+// combinations, that mistake can't happen.
+//
+// "native" is listed only where the browser says it can play HLS by itself:
+// Safari, and desktop Chrome since version 142. It's here so you can test the
+// fallback on a Mac, where MSE exists and it would otherwise never run.
+const ENGINE_CHOICES = [
+    { value: "hlsjs:hls", label: "hls.js · HLS" },
+    { value: "shaka:hls", label: "Shaka · HLS" },
+    { value: "shaka:dash", label: "Shaka · DASH" },
+    ...(playsHlsNatively(video) ? [{ value: "native:hls", label: "native · HLS" }] : []),
+];
+
+for (const choice of ENGINE_CHOICES) {
+    const option = document.createElement("option");
+    option.value = choice.value;
+    option.textContent = choice.label;
+    engineSelect.append(option);
+}
+
+function selectedEngine(): { engine: EngineName; protocol: Protocol } {
+    const [engine, protocol] = engineSelect.value.split(":") as [EngineName, Protocol];
+    return { engine, protocol };
+}
 
 for (const name of Object.keys(ALGORITHMS)) {
     const option = document.createElement("option");
@@ -72,7 +101,7 @@ async function endCurrent(): Promise<void> {
 }
 
 function setRunning(active: boolean): void {
-    for (const control of [assetInput, abrSelect, levelSelect, loadButton, roundsInput, runButton]) {
+    for (const control of [assetInput, abrSelect, engineSelect, levelSelect, loadButton, roundsInput, runButton]) {
         control.disabled = active;
     }
     stopButton.disabled = !active;
@@ -83,6 +112,12 @@ async function startExperiment(): Promise<void> {
     if (!assetId) return log("enter an asset id first", "er");
     if (!networkProfile) {
         return log("open the page with ?net=<label> first. Results only compare within one labelled network", "er");
+    }
+    const { engine, protocol } = selectedEngine();
+    if (!CAN_SELECT_LEVEL[engine]) {
+        // Every trial would be recorded as engine-default, whatever the
+        // algorithm: a comparison of the browser against itself.
+        return log(`${engine} picks renditions itself, so your algorithms can't run on it`, "er");
     }
 
     await endCurrent();
@@ -98,6 +133,8 @@ async function startExperiment(): Promise<void> {
             {
                 assetId,
                 networkProfile,
+                engine,
+                protocol,
                 algorithms: ALGORITHMS,
                 rounds: Math.max(1, Number(roundsInput.value) || 5),
                 signal: running.signal,
@@ -229,7 +266,16 @@ function onPlayerEvent(event: PlayerEvent): void {
     }
 }
 
+// Each load() takes a number. After every await it checks it's still the
+// newest; if not, someone changed the asset or engine while it was waiting,
+// and it stops. Without this, two overlapping loads both reach play(): two
+// engines attach to the same <video>, and the first is never destroyed, so it
+// keeps seeking and pausing a video that now belongs to the second.
+let loadGeneration = 0;
+
 async function load(): Promise<void> {
+    const generation = ++loadGeneration;
+
     // A new load ENDS the previous session. The beacon only fires on page
     // exit, so without this the outgoing QoESession is discarded the moment
     // `playback` is reassigned — every session measured and then lost.
@@ -237,24 +283,30 @@ async function load(): Promise<void> {
     // This is also how a feed-style player behaves: swiping to the next item
     // ends one session and begins another, with no page navigation anywhere.
     await endCurrent();
+    if (generation !== loadGeneration) return;
     currentHeight = null;
     clockStart = 0;
     logPanel.textContent = "";
     levelSelect.length = 1;
     levelSelect.value = "-1";
+    levelSelect.disabled = false;
 
     const id = assetInput.value.trim();
     if (!id) return;
+
+    const { engine, protocol } = selectedEngine();
 
     let asset: Asset;
     let url: string;
     try {
         asset = await fetchAsset(id);
-        url = manifestURL(asset);
+        url = manifestURL(asset, protocol);
     } catch (error) {
+        if (generation !== loadGeneration) return;
         log((error as Error).message, "er");
         return;
     }
+    if (generation !== loadGeneration) return;
 
     log(`"${asset.title}" — ${asset.width}x${asset.height} ` +
         `${asset.fps}fps ${asset.duration_s?.toFixed(2)}s`);
@@ -278,10 +330,23 @@ async function load(): Promise<void> {
     playback = play(video, {
         asset,
         url,
+        engine,
+        protocol,
         abr: ALGORITHMS[abrSelect.value],
         networkProfile,
         onEvent: onPlayerEvent,
     });
+
+    if (playback.engine !== engine) {
+        log(`no Media Source Extensions here: the browser's own player took over from ${engine}`, "er");
+    }
+    // The labels this session will be recorded under, which can differ from
+    // what the dropdowns say. Seeing them here is how you catch that.
+    log(`engine: ${playback.engine} · ${protocol} · abr: ${playback.session.context.abrAlgorithm}`);
+
+    // In native playback the browser picks every rendition. A level dropdown
+    // that silently does nothing is worse than a disabled one.
+    levelSelect.disabled = !playback.canSelectLevel;
 }
 
 // snapshot() closes the open interval and immediately reopens it, so polling it
@@ -292,6 +357,9 @@ window.setInterval(() => {
 }, 250);
 
 loadButton.addEventListener("click", () => void load());
+// A different engine is a new session, like a new asset, so each recorded
+// session belongs to exactly one engine.
+engineSelect.addEventListener("change", () => void load());
 assetInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") void load();
 });

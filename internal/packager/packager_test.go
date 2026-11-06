@@ -1,6 +1,7 @@
 package packager
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -77,6 +78,12 @@ func TestArgs(t *testing.T) {
 		}
 		if got != "6" {
 			t.Errorf("--segment_duration = %q, want \"6\"", got)
+		}
+	})
+
+	t.Run("the DASH manifest is static (VOD), not live", func(t *testing.T) {
+		if !slices.Contains(args, "--generate_static_live_mpd") {
+			t.Error("--generate_static_live_mpd missing: the packager would write a live MPD")
 		}
 	})
 

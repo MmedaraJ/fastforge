@@ -19,8 +19,7 @@
 -- net_kbps is the median MEASURED throughput for the group. If it doesn't
 -- match the profile label, check the throttle setting before trusting the row.
 -- failed counts sessions that ended in an error or a timeout.
-SELECT network_profile,
-       abr_algorithm,
+SELECT network_profile, engine, protocol, abr_algorithm,
        count(*)                                                        AS sessions,
        percentile_disc(0.5)  WITHIN GROUP (ORDER BY measured_throughput_kbps) AS net_kbps,
        percentile_disc(0.5)  WITHIN GROUP (ORDER BY startup_ms)        AS p50_startup,
@@ -34,5 +33,5 @@ FROM playback_sessions
 WHERE abr_algorithm IS NOT NULL
   AND network_profile IS NOT NULL
   AND created_at >= :'since'
-GROUP BY network_profile, abr_algorithm
-ORDER BY network_profile, abr_algorithm;
+GROUP BY network_profile, engine, protocol, abr_algorithm
+ORDER BY network_profile, engine, protocol, abr_algorithm;

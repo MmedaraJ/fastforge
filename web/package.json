@@ -14,6 +14,7 @@
     "vite": "^8.3.5"
   },
   "dependencies": {
-    "hls.js": "^1.7.4"
+    "hls.js": "^1.7.4",
+    "shaka-player": "^5.3.3"
   }
 }
