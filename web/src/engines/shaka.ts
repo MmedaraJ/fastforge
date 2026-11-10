@@ -45,6 +45,7 @@ interface ShakaPlayer {
     getVariantTracks(): ShakaTrack[];
     selectVariantTrack(track: ShakaTrack, clearBuffer?: boolean): void;
     getNetworkingEngine(): {
+        registerRequestFilter(filter: (type: number, request: { uris: string[] }) => void): void;
         registerResponseFilter(filter: (type: number, response: ShakaResponse) => void): void;
     } | null;
     addEventListener(type: string, listener: (event: Event) => void): void;
@@ -52,6 +53,23 @@ interface ShakaPlayer {
 
 const SEGMENT_REQUEST: number = shaka.net.NetworkingEngine.RequestType.SEGMENT;
 const CRITICAL: number = shaka.util.Error.Severity.CRITICAL;
+
+/**
+ * Is this URL a video media segment?
+ *
+ * Unlike hls.js, Shaka doesn't give network filters a reliable, version-stable
+ * way to tell audio from video. So this relies on how YOUR packager lays out
+ * files: video under "<height>p/", audio under "audio/", init segments named
+ * init.mp4.
+ *
+ * That's a real weakness and worth knowing about: the two engines decide "is
+ * this a video segment" differently. If your packager's layout ever changes,
+ * this quietly starts counting the wrong files. If the two engines' measured
+ * throughput disagrees, check here first.
+ */
+function isVideoMedia(uri: string): boolean {
+    return !uri.includes("/audio/") && !uri.endsWith("init.mp4");
+}
 
 /**
  * A Shaka AbrManager that makes no decisions of its own.
@@ -77,6 +95,8 @@ class ObeyingAbrManager {
     desired = 0;
     /** Set when the viewer pins a level. While set, it overrides every request. */
     pinned: number | null = null;
+    /** Your ABR's latest choice, waiting for the next segment boundary. */
+    private pending: number | null = null;
 
     constructor(onVariants: (sorted: ShakaVariant[]) => void) {
         this.onVariants = onVariants;
@@ -103,13 +123,48 @@ class ObeyingAbrManager {
         return this.current ?? undefined;
     }
 
-    /** player.ts's choice for upcoming segments. */
+    /**
+     * player.ts's choice for upcoming segments. Remembered here; ShakaEngine
+     * applies it with applyPending() when no video segment is on its way.
+     *
+     * Switching on the spot is what made BOLA chaotic. Your ABR re-asks every
+     * 500 ms, and a switch while a video segment is downloading makes Shaka
+     * throw that segment away and fetch it again from the new rung. Shaka
+     * cancels it outright when the bytes still to come exceed the new rung's
+     * whole segment (StreamingEngine's shouldAbortCurrentRequest_), and even a
+     * finished download is fetched again if the switch lands before it's
+     * appended. So every time BOLA changed its mind mid-download, the 720p
+     * segment on its way was thrown away and refetched at 480p.
+     */
     request(index: number): void {
-        const target = this.variants[this.pinned ?? index];
+        this.pending = index;
+    }
+
+    /**
+     * Apply the latest choice. ShakaEngine calls this only when no video
+     * segment is on its way, so nothing can be thrown away, and Shaka fetches
+     * the next segment from whichever rung is chosen now. That's the contract
+     * of hls.js's nextAutoLevel: a choice applies to the next segment fetched,
+     * never to one already on its way.
+     */
+    applyPending(): void {
+        if (this.pending === null) return;
+        const index = this.pinned ?? this.pending;
+        this.pending = null;
+        this.switchToIndex(index);
+    }
+
+    /** The viewer's pick from the level dropdown, applied straight away. null = automatic again. */
+    pin(index: number | null): void {
+        this.pinned = index;
+        if (index !== null) this.switchToIndex(index);
+    }
+
+    private switchToIndex(index: number): void {
+        const target = this.variants[index];
         if (!target || target === this.current || !this.switchTo) return;
         this.current = target;
-        // false = keep what's already buffered and switch from the next
-        // segment, which is what hls.js's nextAutoLevel does too.
+        // false = keep what's already buffered and switch from the next segment.
         this.switchTo(target, false);
     }
 
@@ -146,15 +201,33 @@ export class ShakaEngine implements Engine {
 
     /** The Shaka variant id at each of our level indices. */
     private ids: number[] = [];
+    /** The picture height at each of our level indices. */
+    private heights: number[] = [];
     private announced = false;
     private lastReported = -1;
     private readonly video: HTMLVideoElement;
-    private readonly opts: EngineOptions
+    private readonly opts: EngineOptions;
+    private readonly onResize = () => this.reportShown();
+    /**
+     * A video segment has been requested and isn't in the buffer yet. While
+     * true, your ABR's choices wait. Cleared by Shaka's 'segmentappended'. A
+     * download cancelled by a seek never gets there; then choices wait until
+     * the next segment is appended, which is late but never wrong.
+     */
+    private videoInFlight = false;
 
     constructor(video: HTMLVideoElement, opts: EngineOptions) {
         this.video = video;
         this.opts = opts;
         this.player = new shaka.Player() as unknown as ShakaPlayer;
+
+        // Keep up to 30 s buffered ahead, like hls.js (maxBufferLength) and your
+        // MSE engine. Shaka's default is 10 s (streaming.bufferingGoal), which
+        // holds the buffer right on BOLA's 480p-to-720p switch point (9.65 s for
+        // your ladder): BOLA then flips between the two however good the
+        // network is. It also means the engines differed in buffer policy, not
+        // just in code, so any comparison between them mixed the two.
+        this.player.configure({ streaming: { bufferingGoal: 30 } });
 
         // Only install the custom manager when your algorithm is in charge.
         // Otherwise Shaka keeps its built-in ABR, which is the control arm.
@@ -176,32 +249,40 @@ export class ShakaEngine implements Engine {
             this.player.configure({ abrFactory: () => manager });
         }
 
-        this.player.getNetworkingEngine()?.registerResponseFilter((type, response) => {
-            if (type !== SEGMENT_REQUEST) return;
+        const net = this.player.getNetworkingEngine();
 
-            // Unlike hls.js, Shaka doesn't give response filters a reliable,
-            // version-stable way to tell audio from video. So this relies on
-            // how YOUR packager lays out files: video under "<height>p/",
-            // audio under "audio/", init segments named init.mp4.
-            //
-            // That's a real weakness and worth knowing about: the two engines
-            // now decide "is this a video segment" differently. If your
-            // packager's layout ever changes, this filter quietly starts
-            // counting the wrong files. If the two engines' measured
-            // throughput disagrees, check here first.
-            if (response.uri.includes("/audio/") || response.uri.endsWith("init.mp4")) return;
-            if (!response.timeMs) return;
+        // A request filter runs just before a request goes out.
+        net?.registerRequestFilter((type, request) => {
+            if (type === SEGMENT_REQUEST && isVideoMedia(request.uris[0] ?? "")) this.videoInFlight = true;
+        });
 
+        net?.registerResponseFilter((type, response) => {
+            if (type !== SEGMENT_REQUEST || !isVideoMedia(response.uri) || !response.timeMs) return;
             this.opts.onDownload(response.data.byteLength, response.timeMs / 1000);
         });
 
-        // 'adaptation' fires when the ABR switches; 'variantchanged' fires on
-        // a manual switch. Shaka reports these when the switch is DECIDED,
-        // while hls.js reports LEVEL_SWITCHED a little later. So the two
-        // engines' time-weighted average bitrates won't line up exactly.
-        // Expect small differences from that alone.
-        this.player.addEventListener("adaptation", () => this.reportActive());
-        this.player.addEventListener("variantchanged", () => this.reportActive());
+        // The segment boundary. Shaka fires 'segmentappended' once a segment is
+        // in the buffer, and schedules the next fetch only after its listeners
+        // have run (StreamingEngine: onSegmentAppended, then scheduleUpdate_).
+        // So a choice applied here is the one that fetch uses. The download
+        // that just finished has already reached your ABR through onDownload,
+        // so the choice includes the freshest measurement there is.
+        this.player.addEventListener("segmentappended", (event) => {
+            if ((event as unknown as { contentType?: string }).contentType !== "video") return;
+            this.videoInFlight = false;
+            this.manager?.applyPending();
+        });
+
+        // Switches are reported when the new rung reaches the screen, the way
+        // hls.js reports LEVEL_SWITCHED. Shaka's own events can't do that:
+        // 'adaptation' fires when a switch is decided, so it counted every
+        // change of mind as a switch, and charged playing time to rungs the
+        // viewer never saw. The video element fires 'resize' when the picture
+        // on screen changes size, and each rung of your ladder has its own
+        // height, so the height says which rung is showing. (A ladder with two
+        // rungs of the same height, say two 1080p bitrates, would need
+        // something else.)
+        this.video.addEventListener("resize", this.onResize);
 
         this.player.addEventListener("error", (event) => {
             const detail = (event as unknown as { detail: { code: number; severity: number } }).detail;
@@ -232,7 +313,9 @@ export class ShakaEngine implements Engine {
         }
 
         // hls.js reports the starting level as a switch; this matches that.
-        this.reportActive();
+        // If the first frame isn't decoded yet, the 'resize' that comes with it
+        // reports it instead.
+        this.reportShown();
     }
 
     start(openingLevel: number): void {
@@ -243,13 +326,17 @@ export class ShakaEngine implements Engine {
     }
 
     requestLevel(index: number): void {
-        this.manager?.request(index);
+        if (!this.manager) return;
+        this.manager.request(index);
+        // Nothing on its way, for instance while Shaka waits for the buffer to
+        // drain below its goal: nothing can be thrown away, so apply it now,
+        // and the next fetch uses it. Otherwise 'segmentappended' applies it.
+        if (!this.videoInFlight) this.manager.applyPending();
     }
 
     setLevel(index: number): void {
         if (this.manager) {
-            this.manager.pinned = index < 0 ? null : index;
-            if (index >= 0) this.manager.request(index);
+            this.manager.pin(index < 0 ? null : index);
             return;
         }
 
@@ -270,6 +357,7 @@ export class ShakaEngine implements Engine {
     }
 
     async destroy(): Promise<void> {
+        this.video.removeEventListener("resize", this.onResize);
         await this.player.destroy();
     }
 
@@ -279,6 +367,7 @@ export class ShakaEngine implements Engine {
         this.announced = true;
 
         this.ids = entries.map((e) => e.id);
+        this.heights = entries.map((e) => e.height);
         const levels: LevelInfo[] = entries.map((e, index) => ({
             index,
             height: e.height,
@@ -289,10 +378,11 @@ export class ShakaEngine implements Engine {
         this.opts.onManifest(levels, audioTracks);
     }
 
-    private reportActive(): void {
-        const active = this.player.getVariantTracks().find((t) => t.active);
-        if (!active) return;
-        const index = this.ids.indexOf(active.id);
+    /** Report the rung on screen, found by the decoded picture's height. */
+    private reportShown(): void {
+        const height = this.video.videoHeight;
+        if (!height) return; // no frame decoded yet
+        const index = this.heights.indexOf(height);
         if (index < 0 || index === this.lastReported) return;
         this.lastReported = index;
         this.opts.onSwitch(index);

@@ -11,7 +11,15 @@ import type { LevelInfo } from "../player";
 export interface AbrInput {
     /** Sorted ascending by bitrate — index matches the player's level index. */
     levels: LevelInfo[];
+    /** The rung on screen now, as the engine last reported it. */
     currentLevel: number;
+    /**
+     * The rung this algorithm asked for last time: -1 before its first choice.
+     * It runs ahead of currentLevel, which only changes once the new rung
+     * reaches the screen, up to a buffer's worth of seconds later. An algorithm
+     * that compares against its own last choice (BOLA-O does) needs this one.
+     */
+    requestedLevel: number;
     /** Seconds of media buffered ahead of the playhead. */
     bufferSeconds: number;
     /** EWMA throughput estimate, or null before the first sample. */

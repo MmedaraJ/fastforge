@@ -150,8 +150,12 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
     // switches through onSwitch, but they don't all have a "current level"
     // property to read.
     let currentLevel = -1;
+    // What your algorithm last asked for. Not the same as currentLevel: a
+    // request only reaches the screen once its segment plays, so the two can
+    // disagree for up to a buffer's worth of seconds.
+    let requestedLevel = -1;
 
-    const on = <K extends keyof HTMLVideoElementEventMap>(type: K, fn: () => void) => {
+    const on =<K extends keyof HTMLVideoElementEventMap>(type: K, fn: () => void) => {
         video.addEventListener(type, fn);
         return () => video.removeEventListener(type, fn);
     };
@@ -216,12 +220,14 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
         const next = abr.choose({
             levels,
             currentLevel,
+            requestedLevel,
             bufferSeconds: bufferedAhead(),
             throughputKbps: throughput.kbps,
             segmentSeconds: SEGMENT_SECONDS,
             playbackRate: Math.abs(video.playbackRate) || 1,
         });
         if (next < 0) return;
+        requestedLevel = next;
         engine.requestLevel(next);
     }
 
@@ -247,12 +253,14 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
                 ? abr.choose({
                       levels,
                       currentLevel: -1,
+                      requestedLevel: -1,
                       bufferSeconds: 0,
                       throughputKbps: throughput.kbps,
                       segmentSeconds: SEGMENT_SECONDS,
                       playbackRate: Math.abs(video.playbackRate) || 1,
                   })
                 : -1;
+            if (opening >= 0) requestedLevel = opening;
 
             // Required by the Engine contract: start() is called before this
             // callback returns. See EngineCallbacks.onManifest for why.
