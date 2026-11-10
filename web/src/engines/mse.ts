@@ -1,7 +1,7 @@
-import { parseMpd } from "./dash/mpd";
-import { parseMaster, parseMedia } from "./hls/playlist";
 import type { MediaPlaylist } from "./hls/playlist";
-import type { Presentation, Rung } from "./presentation";
+import { readPresentation } from "./manifest";
+import { takePreloaded } from "./preload";
+import type { Rung } from "./presentation";
 import type { Engine, EngineOptions, LevelInfo } from "./types";
 
 /*
@@ -120,15 +120,8 @@ export class MseEngine implements Engine {
     }
 
     async load(url: string): Promise<void> {
-        // Both formats say what they are in their first bytes: an HLS
-        // playlist must begin with #EXTM3U (RFC 8216), and an MPD is XML
-        // whose root is <MPD>. Reading the content, not the URL's extension,
-        // also works for signed URLs that end in a query string.
-        const text = (await this.fetchText(url)).trimStart();
-        let presentation: Presentation;
-        if (text.startsWith("#EXTM3U")) presentation = await this.fromHls(text, url);
-        else if (text.includes("<MPD")) presentation = parseMpd(text, url);
-        else throw new Error("mse: the manifest is neither HLS (#EXTM3U) nor DASH (<MPD>)");
+        // HLS or DASH, read the same way the preloader reads it (manifest.ts)
+        const presentation = await readPresentation(url, (u) => this.fetchText(u));
         if (this.destroyed) return;
         if (presentation.rungs.length === 0) throw new Error("mse: the manifest lists no video renditions");
 
@@ -154,34 +147,6 @@ export class MseEngine implements Engine {
         this.video.addEventListener("error", this.onVideoError);
         this.timer = window.setInterval(() => this.tick(), TICK_MS);
         this.tick();
-    }
-
-    /**
-     * HLS: the master playlist names a media playlist per rung, so those are
-     * fetched too. A DASH MPD already lists every segment, so parseMpd()
-     * needs no further requests: one round trip fewer before the first
-     * segment, the difference Run Review's manifest comparison shows.
-     */
-    private async fromHls(text: string, url: string): Promise<Presentation> {
-        const master = parseMaster(text, url);
-
-        // The audio rendition the variants point at. Your stream has one.
-        const group = master.variants[0]?.audioGroup ?? null;
-        const audio = master.audio.find((a) => a.groupId === group) ?? null;
-
-        // Every media playlist, fetched up front: four small text files for
-        // your ladder. hls.js loads a level's playlist only when it first
-        // needs it; for VOD that saves little.
-        const [videoPlaylists, audioPlaylist] = await Promise.all([
-            Promise.all(master.variants.map(async (v) => parseMedia(await this.fetchText(v.uri), v.uri))),
-            audio ? this.fetchText(audio.uri).then((body) => parseMedia(body, audio.uri)) : Promise.resolve(null),
-        ]);
-
-        return {
-            rungs: master.variants.map((v, i) => ({ bandwidth: v.bandwidth, height: v.height, codecs: v.codecs, playlist: videoPlaylists[i] })),
-            audio: audioPlaylist,
-            audioTracks: master.audio.length,
-        };
     }
 
     start(openingLevel: number): void {
@@ -359,7 +324,7 @@ export class MseEngine implements Engine {
             // boundaries aligned across rungs, segment N covers the same
             // seconds in every rung, so a switch is just this: one small file,
             // then segment N of the new rung.
-            
+
             const newRendition = track.initLevel !== level;
             if (newRendition && !playlist.initUri) throw new Error("mse: media playlist has no EXT-X-MAP init segment");
 
@@ -544,8 +509,12 @@ export class MseEngine implements Engine {
     // ---------------------------------------------------------------------
 
     private async fetchText(url: string): Promise<string> {
+        const preloaded = await this.fromPreload(url);
+        if (preloaded) return new TextDecoder().decode(preloaded);
+
         const response = await fetch(url, { signal: this.controller.signal });
         if (!response.ok) throw new Error(`mse: ${response.status} for ${url}`);
+
         return response.text();
     }
 
@@ -556,6 +525,16 @@ export class MseEngine implements Engine {
      * that their timing is mostly latency.
      */
     private async fetchBytes(url: string, measure: boolean): Promise<ArrayBuffer> {
+        // Preloaded bytes are never measured. They crossed the network
+        // earlier, while something else was playing. Timed now, your first
+        // 480p segment (1,060,817 bytes) comes out of memory in under a
+        // millisecond: over 8.5 million kbps. As the session's first sample
+        // that is the whole estimate (the EWMA's zero-bias correction does
+        // that with one sample), and your throughput rule asks for 720p on a
+        // link that can't carry it.
+        const preloaded = await this.fromPreload(url);
+        if (preloaded) return preloaded;
+
         let lastError: unknown = null;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             const started = performance.now();
@@ -575,6 +554,21 @@ export class MseEngine implements Engine {
             }
         }
         throw lastError;
+    }
+
+    /**
+     * The preloaded download of `url`, if the feed fetched it ahead of time
+     * (preload.ts). Null if it didn't, or if that download failed, and then
+     * the caller fetches the file itself.
+     */
+    private async fromPreload(url: string): Promise<ArrayBuffer | null> {
+        const entry = takePreloaded(url);
+        if (!entry) return null;
+        try {
+            return await entry;
+        } catch {
+            return null;
+        }
     }
 
     // ---------------------------------------------------------------------

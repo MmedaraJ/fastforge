@@ -1,10 +1,10 @@
 import "./style.css";
-import { CAN_SELECT_LEVEL, fetchAsset, manifestURL, play, playsHlsNatively } from "./player";
 import type { Asset, EngineName, Playback, PlayerEvent, Protocol } from "./player";
 import { reportOnExit, reportSession, sendBeacon } from "./beacon";
 import { runExperiment } from "./experiment";
 import type { QoESnapshot } from "./qoe";
 import { ALGORITHMS } from "./abr";
+import { CAN_SELECT_LEVEL, clearPreloaded, fetchAsset, manifestURL, play, playsHlsNatively, preloadStart } from "./player";
 
 const el = <T extends HTMLElement>(id: string): T =>
     document.getElementById(id) as T;
@@ -34,6 +34,67 @@ let running: AbortController | null = null;
 let playback: Playback | null = null;
 let currentHeight: number | null = null;
 let clockStart = 0;
+
+// ---------------------------------------------------------------------
+// Feed mode (Milestone 12)
+//
+// ?feed=<id>,<id>,… plays those assets in order, one "next" press each, the
+// way a short-video app moves through its feed. While one plays, the next is
+// preloaded. ?preload=0 turns preloading off, for the cold comparison.
+// ---------------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const feed = (params.get("feed") ?? "").split(",").map((id) => id.trim()).filter(Boolean);
+const preloadEnabled = params.get("preload") !== "0";
+const nextButton = el<HTMLButtonElement>("next");
+nextButton.hidden = feed.length < 2;
+let feedIndex = 0;
+
+/**
+ * Preloading shares the link with the video that's playing, so it waits
+ * until that video can spare it: 10 s of buffer ahead. At 2500k the preload
+ * took 7.6 s alongside playback and would take 3.8 s alone, so 10 s of
+ * buffer outlasts it even if playback got none of the link meanwhile.
+ */
+const PRELOAD_AFTER_S = 10;
+
+/**
+ * The preload in progress or finished, for the asset that comes next. It
+ * keeps the asset's record too, so pressing next doesn't look it up again.
+ */
+let preload: { assetId: string; controller: AbortController; asset: Asset | null; ready: boolean } | null = null;
+
+function maybePreload(s: QoESnapshot): void {
+    if (feed.length < 2 || !preloadEnabled || preload || !playback) return;
+    // Only your MSE engine reads the preload store.
+    if (playback.engine !== "mse") return;
+    if (s.startupMs === null || bufferAhead() < PRELOAD_AFTER_S) return;
+    void startPreload(feed[(feedIndex + 1) % feed.length], selectedEngine().protocol);
+}
+
+async function startPreload(assetId: string, protocol: Protocol): Promise<void> {
+    const controller = new AbortController();
+    const mine: NonNullable<typeof preload> = { assetId, controller, asset: null, ready: false };
+    preload = mine;
+    const started = performance.now();
+    log(`preloading next: ${assetId}`);
+    try {
+        const asset = await fetchAsset(assetId);
+        mine.asset = asset;
+        const bytes = await preloadStart(manifestURL(asset, protocol), controller.signal);
+        if (preload !== mine) return;
+        mine.ready = true;
+        log(`preloaded ${assetId}: ${Math.round(bytes / 1000)} kB in ${((performance.now() - started) / 1000).toFixed(2)} s`);
+    } catch (error) {
+        if (!controller.signal.aborted) log(`preload failed: ${(error as Error).message}`, "er");
+    }
+}
+
+async function next(): Promise<void> {
+    if (feed.length < 2) return;
+    feedIndex = (feedIndex + 1) % feed.length;
+    assetInput.value = feed[feedIndex];
+    await load();
+}
 
 const engineSelect = el<HTMLSelectElement>("engine");
 
@@ -296,12 +357,27 @@ async function load(): Promise<void> {
     const id = assetInput.value.trim();
     if (!id) return;
 
+    // A preload for this asset is what the engine will now use, even if
+    // it's still downloading: the engine waits for it rather than asking
+    // twice. Anything else in the store is useless now, so stop the preload
+    // and drop what it kept.
+    const reuse = preload?.assetId === id ? preload : null;
+    const preloaded = reuse ? (reuse.ready ? "preloaded" : "preload still downloading") : null;
+    if (!reuse) {
+        preload?.controller.abort();
+        clearPreloaded();
+    }
+    preload = null;
+
     const { engine, protocol } = selectedEngine();
 
     let asset: Asset;
     let url: string;
     try {
-        asset = await fetchAsset(id);
+        // The preload already looked this asset up. A real feed gets each
+        // item's URLs with the feed itself; looking it up again here is a
+        // round trip the viewer would wait through for nothing.
+        asset = reuse?.asset ?? (await fetchAsset(id));
         url = manifestURL(asset, protocol);
     } catch (error) {
         if (generation !== loadGeneration) return;
@@ -329,6 +405,8 @@ async function load(): Promise<void> {
         log("no ?net= label: this session won't appear in the comparison", "er");
     }
 
+    if (preloaded) log(`${preloaded}: the first files come from memory`);
+
     playback = play(video, {
         asset,
         url,
@@ -355,10 +433,14 @@ async function load(): Promise<void> {
 // is safe and accumulates no error — the accrue() design is what makes a live
 // readout and a final beacon the same code path.
 window.setInterval(() => {
-    if (playback) render(playback.session.snapshot());
+    if (!playback) return;
+    const s = playback.session.snapshot();
+    render(s);
+    maybePreload(s);
 }, 250);
 
 loadButton.addEventListener("click", () => void load());
+nextButton.addEventListener("click", () => void next());
 // A different engine is a new session, like a new asset, so each recorded
 // session belongs to exactly one engine.
 engineSelect.addEventListener("change", () => void load());
@@ -372,7 +454,8 @@ levelSelect.addEventListener("change", () => {
 });
 
 // ?asset=<id> loads immediately, so reloading after a code change costs nothing.
-const fromQuery = new URLSearchParams(location.search).get("asset");
+// So does ?feed=, starting at its first asset.
+const fromQuery = params.get("asset") ?? feed[0] ?? null;
 if (fromQuery) {
     assetInput.value = fromQuery;
     void load();

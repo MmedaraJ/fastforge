@@ -10,6 +10,8 @@ import { QoESession } from "./qoe";
 // reaches into src/engines/.
 export type { EngineName, LevelInfo, Protocol };
 export { CAN_SELECT_LEVEL, playsHlsNatively };
+// Feed preloading (Milestone 12), through the same door.
+export { clearPreloaded, preloadStart } from "./engines/preload";
 
 export interface Rendition {
   height: number;
