@@ -6,6 +6,7 @@ import type { Engine, EngineOptions, LevelInfo } from "./types";
 
 /*
  * fastforge's own engine: HLS or DASH played straight through Media Source
+ * Extensions, with no library in between.
  *
  * MSE splits the work. The browser still demuxes and decodes; your code
  * decides what to download, downloads it, and hands the bytes over. Every
@@ -25,6 +26,12 @@ import type { Engine, EngineOptions, LevelInfo } from "./types";
  * in load(): HLS and DASH both become one Presentation (presentation.ts), and
  * everything after that is the same code for both.
  */
+
+/**
+ * How far past the end of the buffered video audio may download: one segment
+ * of your ladder. See audioMayLoad() for why audio needs a limit at all.
+ */
+const AUDIO_LEAD = 6;
 
 /** Seconds of media to keep downloaded ahead of the playhead. */
 const BUFFER_AHEAD = 30;
@@ -298,12 +305,39 @@ export class MseEngine implements Engine {
             for (const track of this.tracks) {
                 if (track.busy || track.done) continue;
                 if (bufferedAhead(track.buffer, now) >= BUFFER_AHEAD) continue;
+                if (track.kind === "audio" && !this.audioMayLoad(track, now)) continue;
                 void this.loadNext(track);
             }
         }
 
         this.reportShownLevel();
         this.endStreamIfComplete();
+    }
+
+    /**
+     * Audio waits for video.
+     *
+     * Each track used to fill its own 30 s independently. Audio segments are
+     * small (about 98 kB) and video segments big (1,061 kB for your first
+     * 480p one), so at startup audio's loop fetched segments 1 to 5 while
+     * video segment 1 was still downloading. The two shared the link, and
+     * the first frame waited for both.
+     *
+     * Now audio may start a segment only if it begins less than AUDIO_LEAD
+     * seconds after the end of the buffered video. At startup that allows
+     * audio segment 1, which the first frame needs anyway. The same rule
+     * holds after a seek and during a rebuffer, the other times video is the
+     * track everyone is waiting for.
+     */
+    private audioMayLoad(audio: Track, now: number): boolean {
+        const video = this.tracks.find((t) => t.kind === "video");
+        if (!video || video.done) return true;
+        const next = this.playlistFor(audio, 0).segments[audio.next];
+        if (!next) return true;
+        // Nothing buffered at the playhead yet (startup, or just after a
+        // seek) counts as the video ending at the playhead.
+        const videoEnd = bufferedEnd(video.buffer, now) ?? now;
+        return next.start < videoEnd + AUDIO_LEAD;
     }
 
     /** Download the track's next segment (and an init segment first, if the rendition changed) and append it. */
@@ -325,17 +359,25 @@ export class MseEngine implements Engine {
             // boundaries aligned across rungs, segment N covers the same
             // seconds in every rung, so a switch is just this: one small file,
             // then segment N of the new rung.
-            if (track.initLevel !== level) {
-                if (!playlist.initUri) throw new Error("mse: media playlist has no EXT-X-MAP init segment");
+            
+            const newRendition = track.initLevel !== level;
+            if (newRendition && !playlist.initUri) throw new Error("mse: media playlist has no EXT-X-MAP init segment");
+
+            // Both URLs are known, so both requests go out together. Asking
+            // for the segment only once the init segment had arrived cost one
+            // round trip (100 ms on your throttle) at startup and at every
+            // switch. The bytes still go into the buffer in order: init first.
+            const [init, bytes] = await Promise.all([
+                newRendition && playlist.initUri ? this.fetchBytes(playlist.initUri, false) : null,
+                this.fetchBytes(segment.uri, track.kind === "video"),
+            ]);
+            if (epoch !== this.epoch) return;
+
+            if (init) {
                 this.changeType(track, level);
-                const init = await this.fetchBytes(playlist.initUri, false);
-                if (epoch !== this.epoch) return;
                 await this.append(track, init);
                 track.initLevel = level;
             }
-
-            const bytes = await this.fetchBytes(segment.uri, track.kind === "video");
-            if (epoch !== this.epoch) return;
             await this.removeBehind(track);
             await this.append(track, bytes);
 
