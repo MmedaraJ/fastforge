@@ -3,7 +3,7 @@
  * file; nothing outside src/engines/ may import hls.js or Shaka.
  */
 
-export type EngineName = "hlsjs" | "shaka" | "native";
+export type EngineName = "hlsjs" | "shaka" | "native" | "mse";
 export type Protocol = "hls" | "dash";
 
 export interface LevelInfo {

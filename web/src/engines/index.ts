@@ -1,6 +1,7 @@
 import { HlsJsEngine } from "./hlsjs";
 import { NativeEngine } from "./native";
 import { ShakaEngine } from "./shaka";
+import { MseEngine } from "./mse";
 import type { Engine, EngineName, EngineOptions, Protocol } from "./types";
 
 /**
@@ -19,6 +20,7 @@ export const CAN_SELECT_LEVEL: Record<EngineName, boolean> = {
     hlsjs: true,
     shaka: true,
     native: false,
+    mse: true,
 };
 
 /** Media Source Extensions, including Safari's ManagedMediaSource. */
@@ -63,5 +65,7 @@ export function createEngine(name: EngineName, video: HTMLVideoElement, options:
             return new ShakaEngine(video, options);
         case "native":
             return new NativeEngine(video, options);
+        case "mse":
+            return new MseEngine(video, options);
     }
 }

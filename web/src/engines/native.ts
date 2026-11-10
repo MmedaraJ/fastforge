@@ -1,4 +1,5 @@
 import type { Engine, EngineOptions, LevelInfo } from "./types";
+import { parseMaster } from "./hls/playlist";
 
 /**
  * The browser's own HLS player: put the playlist URL in video.src and let the
@@ -43,7 +44,7 @@ export class NativeEngine implements Engine {
         //    origins, so this works.
         const response = await fetch(url);
         if (!response.ok) throw new Error(`native: master playlist returned ${response.status}`);
-        const playlist = parseMasterPlaylist(await response.text());
+        const playlist = parseMaster(await response.text(), url);
 
         this.url = url;
         this.levels = playlist.variants.map((variant, index) => ({
@@ -54,7 +55,7 @@ export class NativeEngine implements Engine {
 
         // player.ts calls start() from inside this callback, as the Engine
         // contract requires.
-        this.opts.onManifest(this.levels, playlist.audioRenditions);
+        this.opts.onManifest(this.levels, playlist.audio.length);
     }
 
     // No openingLevel parameter. TypeScript lets a method take fewer
@@ -103,42 +104,4 @@ export class NativeEngine implements Engine {
         this.lastReported = index;
         this.opts.onSwitch(index);
     }
-}
-
-interface MasterPlaylist {
-    variants: { bandwidth: number; height: number }[];
-    audioRenditions: number;
-}
-
-/**
- * Just enough HLS parsing to list what the browser will be choosing between.
- *
- * A master playlist is plain text. Each rendition is an #EXT-X-STREAM-INF line
- * of comma-separated ATTRIBUTE=value pairs, followed by the URI of that
- * rendition's own playlist. Yours, from Shaka Packager (trimmed):
- *
- *   #EXT-X-MEDIA:TYPE=AUDIO,URI="audio/index.m3u8",GROUP-ID="audio",...
- *   #EXT-X-STREAM-INF:BANDWIDTH=5230661,AVERAGE-BANDWIDTH=4393006,...,RESOLUTION=1920x1080,...,AUDIO="audio"
- *   1080p/index.m3u8
- */
-function parseMasterPlaylist(text: string): MasterPlaylist {
-    const variants: MasterPlaylist["variants"] = [];
-    let audioRenditions = 0;
-
-    for (const line of text.split(/\r?\n/)) {
-        if (line.startsWith("#EXT-X-MEDIA:") && line.includes("TYPE=AUDIO")) audioRenditions++;
-        if (!line.startsWith("#EXT-X-STREAM-INF:")) continue;
-
-        // [:,] means "at the start of an attribute", so this matches
-        // BANDWIDTH= but not the tail of AVERAGE-BANDWIDTH=. BANDWIDTH is the
-        // peak rate, the same value hls.js reports as a level's bitrate, so
-        // levels line up across engines.
-        const bandwidth = Number(/[:,]BANDWIDTH=(\d+)/.exec(line)?.[1] ?? 0);
-        const height = Number(/[:,]RESOLUTION=\d+x(\d+)/.exec(line)?.[1] ?? 0);
-        if (bandwidth > 0) variants.push({ bandwidth, height });
-    }
-
-    // Lowest first, like every other engine's levels.
-    variants.sort((a, b) => a.bandwidth - b.bandwidth);
-    return { variants, audioRenditions };
 }

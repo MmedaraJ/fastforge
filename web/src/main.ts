@@ -49,6 +49,8 @@ const ENGINE_CHOICES = [
     { value: "hlsjs:hls", label: "hls.js · HLS" },
     { value: "shaka:hls", label: "Shaka · HLS" },
     { value: "shaka:dash", label: "Shaka · DASH" },
+    { value: "mse:hls", label: "fastforge MSE · HLS" },
+    { value: "mse:dash", label: "fastforge MSE · DASH" },
     ...(playsHlsNatively(video) ? [{ value: "native:hls", label: "native · HLS" }] : []),
 ];
 
