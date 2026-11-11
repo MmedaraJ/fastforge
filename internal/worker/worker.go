@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/MmedaraJ/fastforge/internal/jobs"
 	"github.com/MmedaraJ/fastforge/internal/ladder"
+	"github.com/MmedaraJ/fastforge/internal/langs"
 	"github.com/MmedaraJ/fastforge/internal/packager"
 	"github.com/MmedaraJ/fastforge/internal/probe"
 	"github.com/MmedaraJ/fastforge/internal/storage"
@@ -87,7 +90,11 @@ func (w *TranscodeWorker) process(ctx context.Context, id, storagePath string) e
 		return fmt.Errorf("creating rendition dir: %w", err)
 	}
 
-	audioPath, err := w.encodeAudioIfPresent(ctx, id, storagePath, src)
+	audio, defaultLanguage, audioTracks, err := w.encodeAudioTracks(ctx, id, storagePath, src)
+	if err != nil {
+		return err
+	}
+	subtitles, subtitleTracks, err := findSubtitles(id)
 	if err != nil {
 		return err
 	}
@@ -107,11 +114,20 @@ func (w *TranscodeWorker) process(ctx context.Context, id, storagePath string) e
 	if err := store.SetProgressStage(ctx, w.Pool, id, "packaging"); err != nil {
 		return err
 	}
-	hlsPath, dashPath, err := w.packageAsset(ctx, id, produced, audioPath)
+	hlsPath, dashPath, err := w.packageAsset(ctx, id, packager.Job{
+		Video:           produced,
+		Audio:           audio,
+		Subtitles:       subtitles,
+		DefaultLanguage: defaultLanguage,
+	})
 	if err != nil {
 		return err
 	}
 	if err := store.SavePackaging(ctx, w.Pool, id, hlsPath, dashPath); err != nil {
+		return err
+	}
+	// Recorded only now: these are the tracks the manifests actually offer.
+	if err := store.SaveTracks(ctx, w.Pool, id, append(audioTracks, subtitleTracks...)); err != nil {
 		return err
 	}
 	slog.Info("packaged", "asset_id", id, "hls", hlsPath, "dash", dashPath)
@@ -152,22 +168,78 @@ func (w *TranscodeWorker) inspect(ctx context.Context, id, storagePath string) (
 	return src, rungs, nil
 }
 
-// encodeAudioIfPresent returns "" for a silent source, which the packager
-// treats as "video only" rather than as an error.
+// encodeAudioTracks encodes every audio stream in the source, one per
+// language, each shared by every rung. It returns them ready for packaging,
+// the default language, and their rows for the tracks table. A silent source
+// returns none, which the packager treats as "video only" rather than as an
+// error.
 //
 // Audio runs before video because it takes seconds: a source with broken audio
 // fails before we spend minutes encoding pictures we're going to throw away.
-func (w *TranscodeWorker) encodeAudioIfPresent(ctx context.Context, id, storagePath string, src probe.Result) (string, error) {
-	if src.AudioCodec == "" {
+func (w *TranscodeWorker) encodeAudioTracks(ctx context.Context, id, storagePath string, src probe.Result) ([]packager.Audio, string, []store.Track, error) {
+	if len(src.AudioStreams) == 0 {
 		slog.Info("source has no audio stream; packaging video only", "asset_id", id)
-		return "", nil
+		return nil, "", nil, nil
 	}
-	track := ladder.BuildAudioTrack(ladder.DefaultLadder)
-	path, err := w.encodeAudio(ctx, id, storagePath, track)
+
+	// The default is the stream the file marks as default, else the first.
+	def := 0
+	for i, s := range src.AudioStreams {
+		if s.Default {
+			def = i
+			break
+		}
+	}
+
+	settings := ladder.BuildAudioTrack(ladder.DefaultLadder)
+	audio := make([]packager.Audio, 0, len(src.AudioStreams))
+	tracks := make([]store.Track, 0, len(src.AudioStreams))
+	for i, s := range src.AudioStreams {
+		path, err := w.encodeAudio(ctx, id, storagePath, s.Index, settings, i == def)
+		if err != nil {
+			return nil, "", nil, err
+		}
+		language := langs.Normalize(s.Language)
+		label := langs.Label(s.Language, s.Title)
+		audio = append(audio, packager.Audio{Path: path, Language: language, Label: label})
+		tracks = append(tracks, store.Track{Kind: "audio", Language: language, Label: label, IsDefault: i == def, Path: path})
+	}
+
+	// An untagged default is still the default: the packager writes "und"
+	// for it, and matching "und" here marks it DEFAULT=YES.
+	defaultLanguage := langs.Normalize(src.AudioStreams[def].Language)
+	if defaultLanguage == "" {
+		defaultLanguage = "und"
+	}
+	return audio, defaultLanguage, tracks, nil
+}
+
+// findSubtitles lists the WebVTT files uploaded with the asset: one per
+// language, named <language>.vtt by the API. Most assets have none.
+func findSubtitles(id string) ([]packager.Subtitles, []store.Track, error) {
+	dir := storage.SubtitlesDir(id)
+	entries, err := os.ReadDir(dir) // sorted by name, so the order is stable
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, nil
+	}
 	if err != nil {
-		return "", err
+		// Untagged: an unreadable directory is our problem, not the asset's.
+		return nil, nil, fmt.Errorf("listing subtitles: %w", err)
 	}
-	return path, nil
+
+	var subtitles []packager.Subtitles
+	var tracks []store.Track
+	for _, e := range entries {
+		language, ok := strings.CutSuffix(e.Name(), ".vtt")
+		if e.IsDir() || !ok {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		label := langs.Label(language, "")
+		subtitles = append(subtitles, packager.Subtitles{Path: path, Language: language, Label: label})
+		tracks = append(tracks, store.Track{Kind: "subtitles", Language: language, Label: label, Path: path})
+	}
+	return subtitles, tracks, nil
 }
 
 // fail records a permanent problem on the asset and completes the job.
@@ -247,16 +319,16 @@ func (w *TranscodeWorker) encodeRungs(ctx context.Context, id, srcPath string, r
 	return produced, nil
 }
 
-// encodeAudio produces the single audio track shared by every rung. Returns
-// an empty path when the source has no audio at all — a legitimate case
-// (silent footage), not a failure.
-func (w *TranscodeWorker) encodeAudio(ctx context.Context, id, srcPath string, track ladder.AudioTrack) (string, error) {
-	dst := filepath.Join(renditionDir(id), "audio.m4a")
+// encodeAudio produces one audio language from the source's audio stream
+// number `stream`, shared by every rung. The default language is also
+// recorded on the asset itself, as before there were several.
+func (w *TranscodeWorker) encodeAudio(ctx context.Context, id, srcPath string, stream int, track ladder.AudioTrack, isDefault bool) (string, error) {
+	dst := filepath.Join(renditionDir(id), fmt.Sprintf("audio_%d.m4a", stream))
 
 	encodeCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
-	if err := transcode.RunAudio(encodeCtx, srcPath, track, dst); err != nil {
+	if err := transcode.RunAudio(encodeCtx, srcPath, stream, track, dst); err != nil {
 		os.Remove(dst)
 		return "", badMedia(err)
 	}
@@ -266,26 +338,31 @@ func (w *TranscodeWorker) encodeAudio(ctx context.Context, id, srcPath string, t
 		return "", fmt.Errorf("stat audio output: %w", err)
 	}
 
-	if err := store.SaveAudioTrack(ctx, w.Pool, id, dst, track.BitrateKbps); err != nil {
-		return "", err
+	if isDefault {
+		if err := store.SaveAudioTrack(ctx, w.Pool, id, dst, track.BitrateKbps); err != nil {
+			return "", err
+		}
 	}
 
-	slog.Info("audio encoded", "asset_id", id,
+	slog.Info("audio encoded", "asset_id", id, "stream", stream,
 		"bitrate_kbps", track.BitrateKbps, "bytes", info.Size(), "path", dst)
 	return dst, nil
 }
 
-func (w *TranscodeWorker) packageAsset(ctx context.Context, id string, video []packager.Input, audioPath string) (string, string, error) {
-	outDir := packagedDir(id)
+// packageAsset fills in where the output goes and how long segments are,
+// and runs the packager.
+func (w *TranscodeWorker) packageAsset(ctx context.Context, id string, job packager.Job) (string, string, error) {
+	job.OutDir = packagedDir(id)
+	job.SegmentSeconds = ladder.SegmentSeconds
 
 	packCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
-	if err := packager.Run(packCtx, video, audioPath, outDir, ladder.SegmentSeconds); err != nil {
+	if err := packager.Run(packCtx, job); err != nil {
 		return "", "", badMedia(err)
 	}
 
-	hls, dash := packager.ManifestPaths(outDir)
+	hls, dash := packager.ManifestPaths(job.OutDir)
 	return hls, dash, nil
 }
 

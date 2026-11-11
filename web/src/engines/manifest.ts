@@ -39,21 +39,33 @@ async function fromHls(
 ): Promise<Presentation> {
     const master = parseMaster(text, url);
 
-    // The audio rendition the variants point at. Your stream has one.
-    const group = master.variants[0]?.audioGroup ?? null;
-    const audio = master.audio.find((a) => a.groupId === group) ?? null;
+    // The audio and subtitle groups the variants point at. Every variant of
+    // your ladder points at the same two, so the first variant's will do.
+    const audioGroup = master.variants[0]?.audioGroup ?? null;
+    const subtitleGroup = master.variants[0]?.subtitleGroup ?? null;
+    const audio = master.audio.filter((a) => a.groupId === audioGroup);
+    const subtitles = master.subtitles.filter((s) => s.groupId === subtitleGroup);
 
-    // Every media playlist, fetched up front: four small text files for your
-    // ladder. hls.js loads a level's playlist only when it first needs it;
-    // for VOD that saves little.
-    const [videoPlaylists, audioPlaylist] = await Promise.all([
-        Promise.all(master.variants.map(async (v) => parseMedia(await fetchText(v.uri), v.uri))),
-        audio ? fetchText(audio.uri).then((body) => parseMedia(body, audio.uri)) : Promise.resolve(null),
+    // Every media playlist, fetched up front: for your ladder, three video,
+    // two audio and two subtitle playlists, all small text files, all at
+    // once. hls.js loads a playlist only when it first needs it; for VOD
+    // that saves little.
+    const read = async (uri: string) => parseMedia(await fetchText(uri), uri);
+    const [videoPlaylists, audioPlaylists, subtitlePlaylists] = await Promise.all([
+        Promise.all(master.variants.map((v) => read(v.uri))),
+        Promise.all(audio.map((a) => read(a.uri))),
+        Promise.all(subtitles.map((s) => read(s.uri))),
     ]);
 
     return {
         rungs: master.variants.map((v, i) => ({ bandwidth: v.bandwidth, height: v.height, codecs: v.codecs, playlist: videoPlaylists[i] })),
-        audio: audioPlaylist,
-        audioTracks: master.audio.length,
+        audio: audio.map((a, i) => ({ language: a.language, label: a.name || a.language, isDefault: a.isDefault, playlist: audioPlaylists[i] })),
+        subtitles: subtitles.map((s, i) => ({
+            language: s.language,
+            label: s.name || s.language,
+            isDefault: s.isDefault,
+            forced: s.forced,
+            playlist: subtitlePlaylists[i],
+        })),
     };
 }

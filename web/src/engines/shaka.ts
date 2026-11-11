@@ -1,5 +1,5 @@
 import shaka from "shaka-player";
-import type { Engine, EngineOptions, LevelInfo } from "./types";
+import type { Engine, EngineOptions, LevelInfo, TrackInfo } from "./types";
 
 // Fills in browser APIs Shaka expects but some browsers lack. Must run before
 // any Player is created.
@@ -30,6 +30,21 @@ interface ShakaVariant {
     audio: { id: number } | null;
 }
 
+/** One audio language, as getAudioTracks() lists it. */
+interface ShakaAudioTrack {
+    language: string;
+    label: string | null;
+    active: boolean;
+}
+
+/** One subtitle language, as getTextTracks() lists it. */
+interface ShakaTextTrack {
+    id: number;
+    language: string;
+    label: string | null;
+    active: boolean;
+}
+
 interface ShakaResponse {
     uri: string;
     data: ArrayBuffer | ArrayBufferView;
@@ -44,6 +59,11 @@ interface ShakaPlayer {
     getConfiguration(): { abr: { enabled: boolean } };
     getVariantTracks(): ShakaTrack[];
     selectVariantTrack(track: ShakaTrack, clearBuffer?: boolean): void;
+    getManifest(): { variants: ShakaVariant[] } | null;
+    getAudioTracks(): ShakaAudioTrack[];
+    selectAudioTrack(track: ShakaAudioTrack, safeMargin?: number): void;
+    getTextTracks(): ShakaTextTrack[];
+    selectTextTrack(track: ShakaTextTrack | null): void;
     getNetworkingEngine(): {
         registerRequestFilter(filter: (type: number, request: { uris: string[] }) => void): void;
         registerResponseFilter(filter: (type: number, response: ShakaResponse) => void): void;
@@ -66,9 +86,15 @@ const CRITICAL: number = shaka.util.Error.Severity.CRITICAL;
  * this a video segment" differently. If your packager's layout ever changes,
  * this quietly starts counting the wrong files. If the two engines' measured
  * throughput disagrees, check here first.
+ * 
+ * files: video under "<height>p/", audio under "audio/<language>/", subtitles
+ * under "text/<language>/" as .vtt files, init segments named init.mp4.
+ * Subtitle segments are about 150 bytes each: timed as video, each would be
+ * a sample of about 10 kbps (150 bytes in a 100 ms round trip), dragging the
+ * estimate down.
  */
 function isVideoMedia(uri: string): boolean {
-    return !uri.includes("/audio/") && !uri.endsWith("init.mp4");
+    return !uri.includes("/audio/") && !uri.includes("/text/") && !uri.endsWith("init.mp4") && !uri.endsWith(".vtt");
 }
 
 /**
@@ -165,6 +191,10 @@ class ObeyingAbrManager {
         if (!target || target === this.current || !this.switchTo) return;
         this.current = target;
         // false = keep what's already buffered and switch from the next segment.
+        // Remembered for chooseVariant(). Shaka asks again whenever the
+        // audio language changes, with that language's variants, and the
+        // answer must be the rung playing now, not the opening one.
+        this.desired = index;
         this.switchTo(target, false);
     }
 
@@ -284,6 +314,13 @@ export class ShakaEngine implements Engine {
         // something else.)
         this.video.addEventListener("resize", this.onResize);
 
+        // The menus: an audio language chosen ('variantchanged', fired when
+        // Shaka switches, before the new language is heard), subtitles
+        // chosen ('textchanged'), and the lists themselves ('trackschanged').
+        for (const type of ["variantchanged", "textchanged", "trackschanged"]) {
+            this.player.addEventListener(type, () => this.reportTracks());
+        }
+
         this.player.addEventListener("error", (event) => {
             const detail = (event as unknown as { detail: { code: number; severity: number } }).detail;
             this.opts.onError(`shaka/${detail.code}`, detail.severity === CRITICAL);
@@ -316,6 +353,7 @@ export class ShakaEngine implements Engine {
         // If the first frame isn't decoded yet, the 'resize' that comes with it
         // reports it instead.
         this.reportShown();
+        this.reportTracks();
     }
 
     start(openingLevel: number): void {
@@ -356,6 +394,37 @@ export class ShakaEngine implements Engine {
             : this.player.getConfiguration().abr.enabled;
     }
 
+    selectAudio(id: number): void {
+        const track = this.player.getAudioTracks()[id];
+        // No safeMargin, so Shaka's default of 0: it clears all the old
+        // language ahead of the playhead and starts again from there, which
+        // stalled playback once per switch in Step 6. A margin keeps that many
+        // seconds of the old language while the new one loads.
+        if (track) this.player.selectAudioTrack(track);
+    }
+
+    selectText(id: number): void {
+        // null unloads the subtitles; there's no separate "hide" in Shaka 5.
+        this.player.selectTextTrack(id < 0 ? null : (this.player.getTextTracks()[id] ?? null));
+        this.reportTracks();
+    }
+
+    private reportTracks(): void {
+        const toInfo = (t: { language: string; label: string | null }, id: number): TrackInfo => ({
+            id,
+            language: t.language,
+            label: t.label || t.language,
+        });
+        const audio = this.player.getAudioTracks();
+        const text = this.player.getTextTracks();
+        this.opts.onTracks({
+            audio: audio.map(toInfo),
+            text: text.map(toInfo),
+            audioId: audio.findIndex((t) => t.active),
+            textId: text.findIndex((t) => t.active),
+        });
+    }
+
     async destroy(): Promise<void> {
         this.video.removeEventListener("resize", this.onResize);
         await this.player.destroy();
@@ -373,7 +442,16 @@ export class ShakaEngine implements Engine {
             height: e.height,
             bitrateKbps: Math.round(e.bandwidth / 1000),
         }));
-        const audioTracks = new Set(entries.map((e) => e.audioId).filter((id) => id !== null)).size;
+        // Shaka gives an AbrManager the variants of ONE audio language (the
+        // one it opens with), and getAudioTracks() is empty until load()
+        // finishes. The manifest has every variant in every language, each
+        // language one audio stream shared by all the rungs. With DASH it's
+        // readable here. With HLS it isn't yet: Shaka picks the opening
+        // variant before it has read the media playlists, so it can fetch
+        // only the ones it needs, and this counts the opening language
+        // alone. The tracks event after load() lists them all.
+        const variants = this.player.getManifest()?.variants ?? entries.map((e) => ({ audio: e.audioId === null ? null : { id: e.audioId } }));
+        const audioTracks = new Set(variants.flatMap((v) => (v.audio ? [v.audio.id] : []))).size;
 
         this.opts.onManifest(levels, audioTracks);
     }

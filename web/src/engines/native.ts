@@ -1,5 +1,19 @@
-import type { Engine, EngineOptions, LevelInfo } from "./types";
+import type { Engine, EngineOptions, LevelInfo, TrackInfo } from "./types";
 import { parseMaster } from "./hls/playlist";
+
+/**
+ * The browser's own audio-track list. Safari has it; Chrome only behind a
+ * flag, and TypeScript's DOM types don't declare it, so it's described here.
+ */
+interface AudioTrackLike {
+    enabled: boolean;
+    language: string;
+    label: string;
+}
+interface AudioTrackListLike extends EventTarget {
+    readonly length: number;
+    [index: number]: AudioTrackLike;
+}
 
 /**
  * The browser's own HLS player: put the playlist URL in video.src and let the
@@ -26,10 +40,20 @@ export class NativeEngine implements Engine {
     // An arrow function stored in a field, so the exact same function object
     // can be passed to both addEventListener and removeEventListener.
     private readonly onPictureSize = () => this.reportRendition();
+    private readonly onTrackChange = () => this.reportTracks();
+
+    /**
+     * Text tracks already on the <video> before this engine handed it a
+     * playlist. A TextTrack can never be taken off its element, so tracks
+     * from earlier sessions (hls.js and your MSE engine both make them) are
+     * still listed in video.textTracks; these aren't this playlist's.
+     */
+    private readonly earlier: Set<TextTrack>;
 
     constructor(video: HTMLVideoElement, opts: EngineOptions) {
         this.video = video;
         this.opts = opts;
+        this.earlier = new Set(Array.from(video.textTracks));
     }
 
     async load(url: string): Promise<void> {
@@ -69,6 +93,14 @@ export class NativeEngine implements Engine {
         this.video.addEventListener("loadedmetadata", this.onPictureSize);
         this.video.addEventListener("resize", this.onPictureSize);
 
+        // In native playback the browser lists the playlist's languages
+        // itself: audio in video.audioTracks, subtitles in video.textTracks.
+        // Both fill in after the playlist is read, and announce it.
+        this.audioTracks()?.addEventListener("addtrack", this.onTrackChange);
+        this.audioTracks()?.addEventListener("change", this.onTrackChange);
+        this.video.textTracks.addEventListener("addtrack", this.onTrackChange);
+        this.video.textTracks.addEventListener("change", this.onTrackChange);
+
         // This line is the whole engine: hand the playlist to the browser.
         this.video.src = this.url;
     }
@@ -83,7 +115,23 @@ export class NativeEngine implements Engine {
         return true;
     }
 
+    selectAudio(id: number): void {
+        const list = this.audioTracks();
+        if (!list) return;
+        for (let i = 0; i < list.length; i++) list[i].enabled = i === id;
+    }
+
+    selectText(id: number): void {
+        this.subtitleTracks().forEach((track, i) => {
+            track.mode = i === id ? "showing" : "disabled";
+        });
+    }
+
     async destroy(): Promise<void> {
+        this.audioTracks()?.removeEventListener("addtrack", this.onTrackChange);
+        this.audioTracks()?.removeEventListener("change", this.onTrackChange);
+        this.video.textTracks.removeEventListener("addtrack", this.onTrackChange);
+        this.video.textTracks.removeEventListener("change", this.onTrackChange);
         this.video.removeEventListener("loadedmetadata", this.onPictureSize);
         this.video.removeEventListener("resize", this.onPictureSize);
         // Removing src alone doesn't make the element let go of the stream;
@@ -91,6 +139,35 @@ export class NativeEngine implements Engine {
         // it detaches.
         this.video.removeAttribute("src");
         this.video.load();
+    }
+
+    private audioTracks(): AudioTrackListLike | undefined {
+        return (this.video as unknown as { audioTracks?: AudioTrackListLike }).audioTracks;
+    }
+
+    /** The playlist's subtitles, as the browser lists them. */
+    private subtitleTracks(): TextTrack[] {
+        return Array.from(this.video.textTracks).filter(
+            (t) => !this.earlier.has(t) && (t.kind === "subtitles" || t.kind === "captions"),
+        );
+    }
+
+    private reportTracks(): void {
+        const list = this.audioTracks();
+        const audio: TrackInfo[] = [];
+        let audioId = -1;
+        for (let i = 0; i < (list?.length ?? 0); i++) {
+            const t = (list as AudioTrackListLike)[i];
+            audio.push({ id: i, language: t.language, label: t.label || t.language });
+            if (t.enabled) audioId = i;
+        }
+        const subtitles = this.subtitleTracks();
+        this.opts.onTracks({
+            audio,
+            text: subtitles.map((t, id) => ({ id, language: t.language, label: t.label || t.language })),
+            audioId,
+            textId: subtitles.findIndex((t) => t.mode === "showing"),
+        });
     }
 
     private reportRendition(): void {

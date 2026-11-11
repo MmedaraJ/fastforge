@@ -97,7 +97,7 @@ func TestVideoArgs(t *testing.T) {
 
 func TestAudioArgs(t *testing.T) {
 	track := ladder.AudioTrack{Codec: "aac", BitrateKbps: 128}
-	args := AudioArgs("storage/sources/x.mov", track, "storage/renditions/x/audio.m4a")
+	args := AudioArgs("storage/sources/x.mov", 1, track, "storage/renditions/x/audio_1.m4a")
 
 	t.Run("carries no video", func(t *testing.T) {
 		if !hasFlag(args, "-vn") {
@@ -117,6 +117,12 @@ func TestAudioArgs(t *testing.T) {
 		}
 		if got, _ := argValue(args, "-ac"); got != "2" {
 			t.Errorf("-ac = %q, want \"2\" (stereo downmix)", got)
+		}
+	})
+
+	t.Run("takes the one audio stream it's given", func(t *testing.T) {
+		if got, _ := argValue(args, "-map"); got != "0:a:1" {
+			t.Errorf("-map = %q, want \"0:a:1\": the second audio stream, counting audio only", got)
 		}
 	})
 }

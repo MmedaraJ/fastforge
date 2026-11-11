@@ -46,12 +46,18 @@ func VideoArgs(srcPath string, r ladder.Rung, dstPath string) []string {
 	}
 }
 
-func AudioArgs(srcPath string, t ladder.AudioTrack, dstPath string) []string {
+// AudioArgs builds the FFmpeg argument list for one audio language: the
+// source's audio stream number `stream`, counting audio streams only.
+func AudioArgs(srcPath string, stream int, t ladder.AudioTrack, dstPath string) []string {
 	return []string{
 		"-nostdin",
 		"-y",
 		"-i", srcPath,
 
+		// This audio stream and nothing else. Without -map, FFmpeg picks one
+		// audio stream by itself (the one with the most channels), whatever
+		// language it is.
+		"-map", fmt.Sprintf("0:a:%d", stream),
 		"-vn", // no video stream in the output
 
 		"-c:a", t.Codec,
@@ -73,9 +79,9 @@ func RunVideo(ctx context.Context, srcPath string, r ladder.Rung, dstPath string
 	return Run(ctx, VideoArgs(srcPath, r, dstPath), fmt.Sprintf("%dp video", r.Height))
 }
 
-// RunAudio encodes the shared audio track.
-func RunAudio(ctx context.Context, srcPath string, t ladder.AudioTrack, dstPath string) error {
-	return Run(ctx, AudioArgs(srcPath, t, dstPath), "audio")
+// RunAudio encodes one audio language, shared by every rung.
+func RunAudio(ctx context.Context, srcPath string, stream int, t ladder.AudioTrack, dstPath string) error {
+	return Run(ctx, AudioArgs(srcPath, stream, t, dstPath), fmt.Sprintf("audio stream %d", stream))
 }
 
 // Run execs ffmpeg and turns a failure into an error carrying its stderr.

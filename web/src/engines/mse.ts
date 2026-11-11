@@ -1,8 +1,9 @@
 import type { MediaPlaylist } from "./hls/playlist";
 import { readPresentation } from "./manifest";
 import { takePreloaded } from "./preload";
-import type { Rung } from "./presentation";
+import type { AudioOption, Rung, SubtitleOption } from "./presentation";
 import type { Engine, EngineOptions, LevelInfo } from "./types";
+import { parseVtt, type Cue } from "./webvtt";
 
 /*
  * fastforge's own engine: HLS or DASH played straight through Media Source
@@ -33,6 +34,13 @@ import type { Engine, EngineOptions, LevelInfo } from "./types";
  */
 const AUDIO_LEAD = 6;
 
+/**
+ * When the viewer changes audio language, the old language is cut this far
+ * ahead of the playhead, once the new one has arrived. hls.js uses the same
+ * 0.25 s (its nextAudioTrackBufferFlushForwardOffset). See switchAudio().
+ */
+const AUDIO_SWITCH_OFFSET = 0.25;
+
 /** Seconds of media to keep downloaded ahead of the playhead. */
 const BUFFER_AHEAD = 30;
 
@@ -49,6 +57,21 @@ const TICK_MS = 250;
 /** Tries per file before a network failure counts as fatal. */
 const MAX_ATTEMPTS = 3;
 
+/**
+ * A video segment that arrives in less time than this came from the
+ * browser's HTTP cache, not the network. See fetchBytes() for why that
+ * matters. dash.js makes the same call with its cacheLoadThresholds setting
+ * (10 ms for video in v5). In Chromium, cache hits of your 480p segments took
+ * 3 to 31 ms from fetch() to the last byte (Step 0's runs), so 10 would have
+ * let most of them through. Over the network, a segment takes at least one
+ * round trip: 100 ms on your throttle, about 195 ms to your CDN in your HAR.
+ * The cost: on a link with a round trip under 50 ms, real downloads of small
+ * segments get skipped too. Resource Timing's transferSize (0 for a cache
+ * hit) is exact, but cross-origin it reads 0 for everything unless the
+ * server sends Timing-Allow-Origin.
+ */
+const FROM_CACHE_MS = 50;
+
 interface Track {
     kind: "video" | "audio";
     buffer: SourceBuffer;
@@ -62,6 +85,8 @@ interface Track {
     busy: boolean;
     /** The last segment has been appended. */
     done: boolean;
+    /** Audio only: a new language was chosen and the loop hasn't acted on it yet. */
+    switching: boolean;
 }
 
 /** What was appended where, so switches can be reported when they're seen. */
@@ -79,7 +104,23 @@ export class MseEngine implements Engine {
 
     /** The video rungs, lowest bandwidth first, each with its segments. */
     private rungs: Rung[] = [];
-    private audioPlaylist: MediaPlaylist | null = null;
+        /** Every audio language, and the one the audio track downloads. */
+    private audioOptions: AudioOption[] = [];
+    private audioIndex = 0;
+    /** The language of the audio last appended: what the viewer hears. */
+    private audioHeard = -1;
+
+    private subtitleOptions: SubtitleOption[] = [];
+    /** The subtitles showing; -1 = off. */
+    private textIndex = -1;
+
+    /** The <video>'s TextTrack for each subtitle language, made when first chosen. */
+    private readonly textTracks = new Map<number, TextTrack>();
+    /** Per subtitle language: which of its files are already cues on the track. */
+    private readonly textLoaded = new Map<number, Set<number>>();
+    /** Per subtitle language: start|end|text of every cue added, to skip repeats. */
+    private readonly cueKeys = new Map<number, Set<string>>();
+    private textBusy = false;
 
     private mediaSource: MediaSource | null = null;
     private objectUrl = "";
@@ -127,7 +168,11 @@ export class MseEngine implements Engine {
 
         // From here on, nothing knows which format the manifest was.
         this.rungs = presentation.rungs;
-        this.audioPlaylist = presentation.audio;
+        this.audioOptions = presentation.audio;
+        this.subtitleOptions = presentation.subtitles;
+        // Start with the language the manifest marks as default: DEFAULT=YES
+        // in HLS, Role "main" in DASH. The first one if none is marked.
+        this.audioIndex = Math.max(0, this.audioOptions.findIndex((a) => a.isDefault));
 
         const levels: LevelInfo[] = this.rungs.map((rung, index) => ({
             index,
@@ -138,10 +183,11 @@ export class MseEngine implements Engine {
         // The Engine contract: report the levels before any media is
         // requested. player.ts calls start() from inside this callback, which
         // sets the rendition the first segment will come from.
-        this.opts.onManifest(levels, presentation.audioTracks);
+        this.opts.onManifest(levels, presentation.audio.length);
 
         await this.attach();
         if (this.destroyed) return;
+        this.reportTracks();
 
         this.video.addEventListener("seeking", this.onSeeking);
         this.video.addEventListener("error", this.onVideoError);
@@ -168,6 +214,36 @@ export class MseEngine implements Engine {
         this.pinned = index < 0 ? null : this.clamp(index);
     }
 
+    selectAudio(id: number): void {
+        if (id === this.audioIndex || !this.audioOptions[id]) return;
+        this.audioIndex = id;
+        // The loop makes the change, because only it knows when the audio
+        // SourceBuffer is free: see switchAudio().
+        const audio = this.tracks.find((t) => t.kind === "audio");
+        if (audio) audio.switching = true;
+        this.tick();
+    }
+    
+    selectText(id: number): void {
+        const option = id >= 0 ? this.subtitleOptions[id] : undefined;
+        if (id >= 0 && !option) return;
+        // The language showing is hidden, not emptied: its cues stay on its
+        // track, so choosing it again shows them at once.
+        const showing = this.textTracks.get(this.textIndex);
+        if (showing) showing.mode = "disabled";
+        this.textIndex = option ? id : -1;
+        if (option) {
+            let track = this.textTracks.get(id);
+            if (!track) {
+                track = textTrackFor(this.video, option);
+                this.textTracks.set(id, track);
+            }
+            track.mode = "showing";
+        }
+        this.reportTracks();
+        this.tick();
+    }
+
     get autoEnabled(): boolean {
         return this.pinned === null;
     }
@@ -178,6 +254,9 @@ export class MseEngine implements Engine {
         this.controller.abort();
         this.video.removeEventListener("seeking", this.onSeeking);
         this.video.removeEventListener("error", this.onVideoError);
+        // A TextTrack can't be taken off its <video>, so leave each one
+        // empty and switched off for the next engine, which may reuse it.
+        for (const track of this.textTracks.values()) emptyTrack(track);
         if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
         // Let go of the element the way hls.js does: no src, then load().
         this.video.removeAttribute("src");
@@ -238,7 +317,7 @@ export class MseEngine implements Engine {
         if (!MediaSource.isTypeSupported(videoMime)) throw new Error(`mse: this browser can't play ${videoMime}`);
         const tracks: Track[] = [this.newTrack("video", mediaSource.addSourceBuffer(videoMime), videoMime)];
 
-        if (this.audioPlaylist) {
+        if (this.audioOptions.length > 0) {
             const audioMime = mimeFor(this.rungs[this.desired], "audio");
             if (!MediaSource.isTypeSupported(audioMime)) throw new Error(`mse: this browser can't play ${audioMime}`);
             tracks.push(this.newTrack("audio", mediaSource.addSourceBuffer(audioMime), audioMime));
@@ -249,12 +328,12 @@ export class MseEngine implements Engine {
         // video lasts 30.042 s and your audio 30.038 s.
         mediaSource.duration = Math.max(
             this.rungs[0].playlist.duration,
-            this.audioPlaylist?.duration ?? 0,
+            this.audioOptions[this.audioIndex]?.playlist.duration ?? 0,
         );
     }
 
     private newTrack(kind: Track["kind"], buffer: SourceBuffer, mime: string): Track {
-        return { kind, buffer, mime, next: 0, initLevel: -1, busy: false, done: false };
+        return { kind, buffer, mime, next: 0, initLevel: -1, busy: false, done: false, switching: false };
     }
 
     // ---------------------------------------------------------------------
@@ -268,11 +347,17 @@ export class MseEngine implements Engine {
         if (this.streamingAllowed) {
             const now = this.video.currentTime;
             for (const track of this.tracks) {
-                if (track.busy || track.done) continue;
+                if (track.busy) continue;
+                if (track.switching) {
+                    void this.switchAudio(track);
+                    continue;
+                }
+                if (track.done) continue;
                 if (bufferedAhead(track.buffer, now) >= BUFFER_AHEAD) continue;
                 if (track.kind === "audio" && !this.audioMayLoad(track, now)) continue;
                 void this.loadNext(track);
             }
+            if (this.textIndex >= 0 && !this.textBusy) void this.loadSubtitles(now);
         }
 
         this.reportShownLevel();
@@ -305,12 +390,141 @@ export class MseEngine implements Engine {
         return next.start < videoEnd + AUDIO_LEAD;
     }
 
+    /**
+     * A new audio language, mid-play.
+     *
+     * Everything buffered ahead of the playhead is in the old language: up to
+     * 36 s of it (BUFFER_AHEAD of video, plus AUDIO_LEAD). Letting it play
+     * out would make the viewer wait that long, so it goes, but only once the
+     * new language's first segment has arrived. Cut first and the sound stops
+     * while the new segment downloads; that's a stall, and your session
+     * counts it as a rebuffer.
+     *
+     * The cut is AUDIO_SWITCH_OFFSET ahead of where the playhead is when the
+     * segment arrives, not where it was when the viewer chose. Old audio
+     * between the playhead and the cut plays out; so does old audio the
+     * browser has already read into its decoder. Appending over it isn't
+     * enough: Chrome keeps playing frames it has read even when an append
+     * replaces them in the buffer. remove() is what makes it drop them.
+     */
+    private async switchAudio(track: Track): Promise<void> {
+        track.busy = true;
+        const epoch = this.epoch;
+        const language = this.audioIndex;
+        try {
+            const playlist = this.playlistFor(track, 0);
+            const index = segmentAt(playlist, this.video.currentTime + AUDIO_SWITCH_OFFSET);
+            const segment = playlist.segments[index];
+            // Too close to the end for another segment: the old language finishes.
+            if (!segment || !playlist.initUri) {
+                track.switching = false;
+                return;
+            }
+
+            // The new language's init segment and the segment that will
+            // play next, together, as in loadNext().
+            const [init, bytes] = await Promise.all([
+                this.fetchBytes(playlist.initUri, false),
+                this.fetchBytes(segment.uri, false),
+            ]);
+            // A seek, or another change of language, overtook this one.
+            // `switching` is still set, so the next tick starts again from
+            // wherever the playhead is now, in whichever language is chosen
+            // now. A seek that aborted the downloads lands in the catch below
+            // and comes back the same way.
+            if (epoch !== this.epoch || language !== this.audioIndex) return;
+
+            const ms = this.mediaSource;
+            const ranges = track.buffer.buffered;
+            const end = ranges.length > 0 ? ranges.end(ranges.length - 1) : 0;
+            const cut = this.video.currentTime + AUDIO_SWITCH_OFFSET;
+            if (ms && end > cut) await this.whenIdle(track, () => track.buffer.remove(cut, ms.duration));
+
+            this.changeType(track, 0);
+            await this.append(track, init);
+            track.initLevel = 0;
+            await this.append(track, bytes);
+            track.next = index + 1;
+            track.done = track.next >= playlist.segments.length;
+            track.switching = false;
+            // The stream may already have been declared complete. Appending
+            // reopens it (the MSE spec moves an "ended" MediaSource back to
+            // "open"), and it's declared complete again once done.
+            this.streamEnded = false;
+
+            this.audioHeard = language;
+            this.reportTracks();
+        } catch (error) {
+            if (!isAbort(error)) this.fail(error);
+        } finally {
+            track.busy = false;
+            this.tick();
+        }
+    }
+
+    /**
+     * Subtitle files near the playhead, turned into cues on the <video>'s
+     * TextTrack. The browser draws them: nothing here runs per frame.
+     * Like media, only what the next BUFFER_AHEAD seconds need is fetched;
+     * unlike media, nothing is ever removed, because a 6 s subtitle file is
+     * a few hundred bytes.
+     */
+    private async loadSubtitles(now: number): Promise<void> {
+        const index = this.textIndex;
+        const option = this.subtitleOptions[index];
+        const track = this.textTracks.get(index);
+        if (!option || !track) return;
+        const loaded = this.textLoaded.get(index) ?? new Set<number>();
+        this.textLoaded.set(index, loaded);
+        const keys = this.cueKeys.get(index) ?? new Set<string>();
+        this.cueKeys.set(index, keys);
+
+        const n = option.playlist.segments.findIndex(
+            (s, i) => !loaded.has(i) && s.start + s.duration > now && s.start < now + BUFFER_AHEAD,
+        );
+        if (n < 0) return;
+
+        this.textBusy = true;
+        try {
+            const cues = parseVtt(await this.fetchText(option.playlist.segments[n].uri));
+            loaded.add(n);
+            for (const cue of cues) {
+                // A cue that crosses a file boundary is written into both
+                // files, so the second copy is skipped.
+                const key = `${cue.start}|${cue.end}|${cue.text}`;
+                if (keys.has(key)) continue;
+                keys.add(key);
+                track.addCue(toVttCue(cue));
+            }
+        } catch (error) {
+            if (isAbort(error)) return;
+            // Missing subtitles are worth a log line, not a dead player.
+            loaded.add(n);
+            const message = error instanceof Error ? error.message : String(error);
+            this.opts.onError(`mse: subtitles: ${message}`, false);
+        } finally {
+            this.textBusy = false;
+        }
+    }
+
+    private reportTracks(): void {
+        this.opts.onTracks({
+            audio: this.audioOptions.map((o, id) => ({ id, language: o.language, label: o.label })),
+            text: this.subtitleOptions.map((o, id) => ({ id, language: o.language, label: o.label })),
+            audioId: this.audioHeard,
+            textId: this.textIndex,
+        });
+    }
+
     /** Download the track's next segment (and an init segment first, if the rendition changed) and append it. */
     private async loadNext(track: Track): Promise<void> {
         const epoch = this.epoch;
         track.busy = true;
+        // Which language this download is in, for audio: a switch can be
+        // asked for while it's on its way.
+        const language = this.audioIndex;
         try {
-            // Audio has one rendition. Video follows the dropdown, then your ABR.
+            // Audio has one rendition per language. Video follows the dropdown, then your ABR.
             const level = track.kind === "video" ? (this.pinned ?? this.desired) : 0;
             const playlist = this.playlistFor(track, level);
             const segment = playlist.segments[track.next];
@@ -348,6 +562,10 @@ export class MseEngine implements Engine {
 
             if (track.kind === "video") {
                 this.appended.push({ start: segment.start, end: segment.start + segment.duration, level });
+            } else if (language !== this.audioHeard) {
+                // The first audio segment of the session is in.
+                this.audioHeard = language;
+                this.reportTracks();
             }
             // A seek that happened during the append moved `next` already.
             if (epoch === this.epoch) {
@@ -545,7 +763,14 @@ export class MseEngine implements Engine {
                 }
                 if (!response.ok) throw new Error(`mse: ${response.status} for ${url}`);
                 const bytes = await response.arrayBuffer();
-                if (measure) this.opts.onDownload(bytes.byteLength, (performance.now() - started) / 1000);
+                const seconds = (performance.now() - started) / 1000;
+                // Cache hits are never measured, for the same reason as
+                // preloaded bytes. Scroll back to a video you watched a
+                // minute ago and its segments come out of the browser's
+                // cache: timed like downloads, they pushed the estimate to
+                // 456,265 kbps in Step 0's first try, which compared the time
+                // to the first byte with 5 ms and let them through.
+                if (measure && seconds * 1000 >= FROM_CACHE_MS) this.opts.onDownload(bytes.byteLength, seconds);
                 return bytes;
             } catch (error) {
                 if (isAbort(error) || (error as { permanent?: boolean }).permanent) throw error;
@@ -576,7 +801,7 @@ export class MseEngine implements Engine {
     // ---------------------------------------------------------------------
 
     private playlistFor(track: Track, level: number): MediaPlaylist {
-        return track.kind === "video" ? this.rungs[level].playlist : (this.audioPlaylist as MediaPlaylist);
+        return track.kind === "video" ? this.rungs[level].playlist : this.audioOptions[this.audioIndex].playlist;
     }
 
     private clamp(index: number): number {
@@ -651,4 +876,53 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
             rejectSleep(new DOMException("aborted", "AbortError"));
         }, { once: true });
     });
+}
+
+/**
+ * The TextTracks this file made. A TextTrack can never be taken off its
+ * <video> (there's addTextTrack() but no remove), and your page plays every
+ * session on the same element, so each engine reuses the track an earlier
+ * one made for the same language rather than piling up new ones.
+ */
+const madeHere = new WeakSet<TextTrack>();
+
+function textTrackFor(video: HTMLVideoElement, option: SubtitleOption): TextTrack {
+    const existing = Array.from(video.textTracks).find(
+        (t) => madeHere.has(t) && t.label === option.label && t.language === option.language,
+    );
+    const track = existing ?? video.addTextTrack("subtitles", option.label, option.language);
+    madeHere.add(track);
+    emptyTrack(track);
+    return track;
+}
+
+/** Remove every cue and switch the track off. Its cue list only exists while it isn't "disabled". */
+function emptyTrack(track: TextTrack): void {
+    track.mode = "hidden";
+    while (track.cues && track.cues.length > 0) track.removeCue(track.cues[0]);
+    track.mode = "disabled";
+}
+
+/** A parsed cue as the browser's VTTCue, with the settings it understands. */
+function toVttCue(cue: Cue): VTTCue {
+    const out = new VTTCue(cue.start, cue.end, cue.text);
+    for (const [key, value] of cue.settings) {
+        // VTTCue throws on a value it doesn't accept; the browser's own
+        // parser skips those, and so does this.
+        try {
+            if (key === "align") out.align = value as AlignSetting;
+            else if (key === "vertical") out.vertical = value as DirectionSetting;
+            else if (key === "size") out.size = parseFloat(value);
+            else if (key === "position") out.position = parseFloat(value);
+            else if (key === "line") {
+                // "85%" is a percentage of the picture's height; "-1" counts
+                // lines from the bottom.
+                out.snapToLines = !value.includes("%");
+                out.line = parseFloat(value);
+            }
+        } catch {
+            // skipped
+        }
+    }
+    return out;
 }

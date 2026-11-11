@@ -1,11 +1,11 @@
 import type { MediaPlaylist, Segment } from "../hls/playlist";
-import type { Presentation, Rung } from "../presentation";
+import type { AudioOption, Presentation, Rung, SubtitleOption } from "../presentation";
 
 /*
- * Just enough DASH to play what your packager writes: one Period, a video and
- * an audio AdaptationSet, and in each Representation a SegmentTemplate with a
- * SegmentTimeline and $Number$ in its media pattern. The result is the same
- * Presentation the HLS path builds, so the engine can't tell them apart.
+ * Just enough DASH to play what your packager writes: one Period; 
+ * a video AdaptationSet, one per audio language and one per subtitle language; 
+ * and in each Representation a SegmentTemplate with a SegmentTimeline and $Number$ 
+ * in its media pattern.
  *
  * These are refused with an error that names them, rather than played
  * wrong: live MPDs, several Periods, SegmentBase or SegmentList,
@@ -32,14 +32,41 @@ export function parseMpd(text: string, url: string): Presentation {
 
     const videoSet = sets.find((set) => kindOf(set) === "video");
     if (!videoSet) throw new Error("mse: the MPD has no video AdaptationSet");
-    const audioReps = sets.filter((set) => kindOf(set) === "audio").flatMap((set) => children(set, "Representation"));
+    
+    // One AdaptationSet per audio language. lang says which language, and a
+    // Role of "main" marks the default: your packager writes it on the
+    // language you name with --default_language. Each set holds one
+    // Representation, because your audio has one bitrate.
+    const audioSets = sets
+        .filter((set) => kindOf(set) === "audio")
+        .map((set) => ({ set, rep: children(set, "Representation")[0] }))
+        .filter((a): a is { set: Element; rep: Element } => a.rep !== undefined);
+    const audio: AudioOption[] = audioSets.map(({ set, rep }) => {
+        const language = set.getAttribute("lang") ?? "";
+        return { language, label: labelOf(set) ?? language, isDefault: hasRole(set, "main"), playlist: segmentsOf(rep, url) };
+    });
+    // The largest audio bitrate, which is what your packager's HLS BANDWIDTH
+    // counts for a variant whose audio group holds several languages.
+    const audioBandwidth = Math.max(0, ...audioSets.map(({ rep }) => Number(rep.getAttribute("bandwidth") ?? 0)));
+    const audioCodec = audioSets[0] ? inherited(audioSets[0].rep, "codecs") : null;
 
-    // Your stream has one audio rendition; with several, a real player would
-    // pick by language. The first one is enough here.
-    const audioRep = audioReps[0] ?? null;
-    const audio = audioRep ? segmentsOf(audioRep, url) : null;
-    const audioBandwidth = audioRep ? Number(audioRep.getAttribute("bandwidth") ?? 0) : 0;
-    const audioCodec = audioRep ? inherited(audioRep, "codecs") : null;
+    // Subtitles: one AdaptationSet per language, WebVTT files listed by the
+    // same kind of SegmentTemplate as media. IMSC/TTML subtitles (a mimeType
+    // of application/ttml+xml, or stpp inside MP4) aren't read here.
+    const subtitles: SubtitleOption[] = sets
+        .filter((set) => kindOf(set) === "text")
+        .flatMap((set) => {
+            const rep = children(set, "Representation")[0];
+            if (!rep || inherited(rep, "mimeType") !== "text/vtt") return [];
+            const language = set.getAttribute("lang") ?? "";
+            return [{
+                language,
+                label: labelOf(set) ?? language,
+                isDefault: hasRole(set, "main"),
+                forced: hasRole(set, "forced-subtitle"),
+                playlist: segmentsOf(rep, url),
+            }];
+        });
 
     const rungs: Rung[] = children(videoSet, "Representation").map((rep) => ({
         // Video and audio are listed separately here; adding them gives what
@@ -52,7 +79,7 @@ export function parseMpd(text: string, url: string): Presentation {
     }));
     rungs.sort((x, y) => x.bandwidth - y.bandwidth);
 
-    return { rungs, audio, audioTracks: audioReps.length };
+    return { rungs, audio, subtitles };
 }
 
 /**
@@ -125,6 +152,18 @@ function kindOf(set: Element): string {
     if (type) return type;
     const mime = set.getAttribute("mimeType") ?? children(set, "Representation")[0]?.getAttribute("mimeType") ?? "";
     return mime.split("/")[0];
+}
+
+/** Does this AdaptationSet carry <Role schemeIdUri="urn:mpeg:dash:role:2011" value="…">? */
+function hasRole(set: Element, value: string): boolean {
+    return children(set, "Role").some(
+        (role) => role.getAttribute("schemeIdUri") === "urn:mpeg:dash:role:2011" && role.getAttribute("value") === value,
+    );
+}
+
+/** A <Label> child, DASH's counterpart of HLS's NAME: your packager writes it from each stream's dash_label. */
+function labelOf(set: Element): string | null {
+    return children(set, "Label")[0]?.textContent?.trim() || null;
 }
 
 /** DASH lets an attribute sit on the Representation or on its AdaptationSet. */

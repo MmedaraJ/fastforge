@@ -2,16 +2,16 @@ import type { AbrAlgorithm } from "./abr";
 import { ThroughputEstimator } from "./abr/ewma";
 import { API_URL } from "./config";
 import { CAN_SELECT_LEVEL, createEngine, playsHlsNatively, resolveEngine } from "./engines";
-import type { EngineName, LevelInfo, Protocol } from "./engines/types";
+import type { EngineName, LevelInfo, Protocol, TrackInfo, TrackList } from "./engines/types";
 import { QoESession } from "./qoe";
 
 // Re-exported so abr/types.ts, main.ts and experiment.ts keep importing from
 // here. This file is the only door into the player; nothing outside it
 // reaches into src/engines/.
-export type { EngineName, LevelInfo, Protocol };
+export type { EngineName, LevelInfo, Protocol, TrackInfo, TrackList };
 export { CAN_SELECT_LEVEL, playsHlsNatively };
 // Feed preloading (Milestone 12), through the same door.
-export { clearPreloaded, preloadStart } from "./engines/preload";
+export { clearPreloaded, dropPreloaded, preloadStart } from "./engines/preload";
 
 export interface Rendition {
   height: number;
@@ -41,6 +41,7 @@ export interface Asset {
 export type PlayerEvent =
     | { type: "manifest"; levels: LevelInfo[]; audioTracks: number }
     | { type: "switch"; index: number; height: number; bitrateKbps: number }
+    | { type: "tracks"; tracks: TrackList }
     | { type: "error"; detail: string; fatal: boolean };
 
 export interface PlayOptions {
@@ -78,6 +79,10 @@ export interface Playback {
     canSelectLevel: boolean;
     /** -1 restores automatic selection. */
     setLevel(index: number): void;
+    /** An id from the latest "tracks" event. */
+    selectAudio(id: number): void;
+    /** An id from the latest "tracks" event, or -1 for no subtitles. */
+    selectText(id: number): void;
     destroy(): Promise<void>;
 }
 
@@ -290,6 +295,10 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
             onEvent({ type: "error", detail, fatal });
             if (fatal) session.failed(detail);
         },
+
+        onTracks(tracks) {
+            onEvent({ type: "tracks", tracks });
+        },
     });
 
     // Set by destroy(). Anything that finishes after that belongs to a
@@ -352,6 +361,8 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
         engine: engineName,
         canSelectLevel,
         setLevel: (index) => engine.setLevel(index),
+        selectAudio: (id) => engine.selectAudio(id),
+        selectText: (id) => engine.selectText(id),
         async destroy() {
             destroyed = true;
             window.clearInterval(poll);

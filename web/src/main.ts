@@ -1,10 +1,11 @@
 import "./style.css";
-import type { Asset, EngineName, Playback, PlayerEvent, Protocol } from "./player";
+import type { Asset, EngineName, Playback, PlayerEvent, Protocol, TrackInfo } from "./player";
 import { reportOnExit, reportSession, sendBeacon } from "./beacon";
 import { runExperiment } from "./experiment";
 import type { QoESnapshot } from "./qoe";
 import { ALGORITHMS } from "./abr";
-import { CAN_SELECT_LEVEL, clearPreloaded, fetchAsset, manifestURL, play, playsHlsNatively, preloadStart } from "./player";
+import { CAN_SELECT_LEVEL, clearPreloaded, dropPreloaded, fetchAsset, manifestURL, 
+    play, playsHlsNatively, preloadStart } from "./player";
 
 const el = <T extends HTMLElement>(id: string): T =>
     document.getElementById(id) as T;
@@ -36,17 +37,67 @@ let currentHeight: number | null = null;
 let clockStart = 0;
 
 // ---------------------------------------------------------------------
+// Audio languages and subtitles (Milestone 13)
+// ---------------------------------------------------------------------
+const audioSelect = el<HTMLSelectElement>("audio");
+const subsSelect = el<HTMLSelectElement>("subs");
+/** What the log last said was heard and shown, so it reports only changes. */
+let heardLabel = "";
+let shownLabel = "";
+
+/** Replace a menu's entries if the list changed, and select `active`. */
+function fillMenu(select: HTMLSelectElement, tracks: TrackInfo[], active: number, offLabel?: string): void {
+    const entries = [
+        ...(offLabel ? [{ value: "-1", text: offLabel }] : []),
+        ...tracks.map((t) => ({
+            value: String(t.id),
+            // "Tiếng Việt (vi)": the name for the viewer, the tag for you.
+            text: t.language && trackName(t) !== t.language ? `${trackName(t)} (${t.language})` : trackName(t),
+        })),
+    ];
+    const unchanged = select.options.length === entries.length &&
+        entries.every((e, i) => select.options[i].value === e.value && select.options[i].textContent === e.text);
+    if (!unchanged) {
+        select.replaceChildren(...entries.map((e) => new Option(e.text, e.value)));
+    }
+    select.value = String(active);
+}
+
+/** A manifest may name a track, tag its language, or neither (your older assets). */
+function trackName(t: TrackInfo): string {
+    return t.label || t.language || "default";
+}
+
+function resetMenus(): void {
+    audioSelect.replaceChildren();
+    audioSelect.disabled = true;
+    subsSelect.replaceChildren(new Option("subtitles off", "-1"));
+    subsSelect.disabled = true;
+    heardLabel = shownLabel = "";
+}
+
+/**
+ * Asset records already looked up, by id. A real feed gets every item's
+ * record with the feed; this page keeps each one it fetches, so going back to
+ * a video doesn't wait on your API again. Only ready assets: one still
+ * processing will have manifests later.
+ */
+const knownAssets = new Map<string, Asset>();
+
+// ---------------------------------------------------------------------
 // Feed mode (Milestone 12)
 //
 // ?feed=<id>,<id>,… plays those assets in order, one "next" press each, the
-// way a short-video app moves through its feed. While one plays, the next is
-// preloaded. ?preload=0 turns preloading off, for the cold comparison.
+// way a short-video app moves through its feed ("previous" goes back). While
+// one plays, the next is preloaded. ?preload=0 turns preloading off, for the
+// cold comparison.
 // ---------------------------------------------------------------------
 const params = new URLSearchParams(location.search);
 const feed = (params.get("feed") ?? "").split(",").map((id) => id.trim()).filter(Boolean);
 const preloadEnabled = params.get("preload") !== "0";
 const nextButton = el<HTMLButtonElement>("next");
-nextButton.hidden = feed.length < 2;
+const prevButton = el<HTMLButtonElement>("prev");
+nextButton.hidden = prevButton.hidden = feed.length < 2;
 let feedIndex = 0;
 
 /**
@@ -58,40 +109,88 @@ let feedIndex = 0;
 const PRELOAD_AFTER_S = 10;
 
 /**
- * The preload in progress or finished, for the asset that comes next. It
- * keeps the asset's record too, so pressing next doesn't look it up again.
+ * A preload in progress, finished or failed. It keeps the asset's record
+ * too, so pressing next doesn't look it up again, and its manifest URL, which
+ * names its files in the preload store. A failed one stays, so it isn't
+ * retried every 250 ms while its video is next.
  */
-let preload: { assetId: string; controller: AbortController; asset: Asset | null; ready: boolean } | null = null;
+interface Preload {
+    assetId: string;
+    manifestUrl: string | null;
+    controller: AbortController;
+    asset: Asset | null;
+    ready: boolean;
+    failed: boolean;
+}
+
+/** Every preload kept, by asset id. */
+const preloads = new Map<string, Preload>();
+
+/**
+ * How far along the feed from the video on screen a preload is kept: 2, not
+ * 1. A viewer who goes back one video usually comes forward again, and the
+ * video after the one they left is already downloaded. Dropped, it's
+ * downloaded again, from the browser's HTTP cache if the cache still has it:
+ * on Nov 10 that took under 3 s and the swipe forward still started in about
+ * 40 ms. Kept, it doesn't depend on the cache.
+ */
+const KEEP_WITHIN = 2;
+
+/** Steps between two feed positions, counting round the end (the feed wraps). */
+function feedDistance(a: number, b: number): number {
+    const d = Math.abs(a - b) % feed.length;
+    return Math.min(d, feed.length - d);
+}
+
+function forget(p: Preload): void {
+    p.controller.abort();
+    if (p.manifestUrl) dropPreloaded(p.manifestUrl);
+    preloads.delete(p.assetId);
+}
 
 function maybePreload(s: QoESnapshot): void {
-    if (feed.length < 2 || !preloadEnabled || preload || !playback) return;
+    if (feed.length < 2 || !preloadEnabled || !playback) return;
     // Only your MSE engine reads the preload store.
     if (playback.engine !== "mse") return;
+    const nextId = feed[(feedIndex + 1) % feed.length];
+    if (preloads.has(nextId)) return;
     if (s.startupMs === null || bufferAhead() < PRELOAD_AFTER_S) return;
-    void startPreload(feed[(feedIndex + 1) % feed.length], selectedEngine().protocol);
+    void startPreload(nextId, selectedEngine().protocol);
 }
 
 async function startPreload(assetId: string, protocol: Protocol): Promise<void> {
     const controller = new AbortController();
-    const mine: NonNullable<typeof preload> = { assetId, controller, asset: null, ready: false };
-    preload = mine;
+    const mine: Preload = { assetId, manifestUrl: null, controller, asset: null, ready: false, failed: false };
+    preloads.set(assetId, mine);
     const started = performance.now();
     log(`preloading next: ${assetId}`);
     try {
-        const asset = await fetchAsset(assetId);
+        const asset = knownAssets.get(assetId) ?? (await fetchAsset(assetId));
+        if (asset.status === "ready") knownAssets.set(assetId, asset);
         mine.asset = asset;
-        const bytes = await preloadStart(manifestURL(asset, protocol), controller.signal);
-        if (preload !== mine) return;
+        mine.manifestUrl = manifestURL(asset, protocol);
+        const bytes = await preloadStart(mine.manifestUrl, controller.signal);
+        if (preloads.get(assetId) !== mine) return;
         mine.ready = true;
         log(`preloaded ${assetId}: ${Math.round(bytes / 1000)} kB in ${((performance.now() - started) / 1000).toFixed(2)} s`);
     } catch (error) {
-        if (!controller.signal.aborted) log(`preload failed: ${(error as Error).message}`, "er");
+        if (controller.signal.aborted) return;
+        log(`preload failed: ${(error as Error).message}`, "er");
+        mine.failed = true;
+        if (mine.manifestUrl) dropPreloaded(mine.manifestUrl);
     }
 }
 
 async function next(): Promise<void> {
     if (feed.length < 2) return;
     feedIndex = (feedIndex + 1) % feed.length;
+    assetInput.value = feed[feedIndex];
+    await load();
+}
+
+async function previous(): Promise<void> {
+    if (feed.length < 2) return;
+    feedIndex = (feedIndex - 1 + feed.length) % feed.length;
     assetInput.value = feed[feedIndex];
     await load();
 }
@@ -320,6 +419,25 @@ function onPlayerEvent(event: PlayerEvent): void {
             log(`\u2192 level ${event.index}  ${event.height}p  ${event.bitrateKbps} kbps`, "sw");
             break;
 
+        case "tracks": {
+            const { audio, text, audioId, textId } = event.tracks;
+            fillMenu(audioSelect, audio, audioId);
+            // One language is nothing to choose between.
+            audioSelect.disabled = audio.length < 2;
+            fillMenu(subsSelect, text, textId, "subtitles off");
+            subsSelect.disabled = text.length === 0;
+            // This event comes with the manifest and again with every change;
+            // the log shows only what changed.
+            const heardTrack = audio.find((t) => t.id === audioId);
+            const shownTrack = text.find((t) => t.id === textId);
+            const heard = heardTrack ? trackName(heardTrack) : "—";
+            const shown = shownTrack ? trackName(shownTrack) : "off";
+            if (heard !== heardLabel || shown !== shownLabel) log(`audio: ${heard} · subtitles: ${shown}`, "sw");
+            heardLabel = heard;
+            shownLabel = shown;
+            break;
+        }
+
         case "error":
             // Non-fatal errors are logged but not acted on — hls.js emits them
             // constantly while self-healing, and treating them as failures is
@@ -353,21 +471,25 @@ async function load(): Promise<void> {
     levelSelect.length = 1;
     levelSelect.value = "-1";
     levelSelect.disabled = false;
+    resetMenus();
 
     const id = assetInput.value.trim();
     if (!id) return;
 
     // A preload for this asset is what the engine will now use, even if
     // it's still downloading: the engine waits for it rather than asking
-    // twice. Anything else in the store is useless now, so stop the preload
-    // and drop what it kept.
-    const reuse = preload?.assetId === id ? preload : null;
-    const preloaded = reuse ? (reuse.ready ? "preloaded" : "preload still downloading") : null;
-    if (!reuse) {
-        preload?.controller.abort();
-        clearPreloaded();
+    // twice. Preloads near this video in the feed stay, so going back and
+    // forth doesn't throw away downloads the viewer will want again; any
+    // further away are stopped and dropped.
+    const reuse = preloads.get(id) ?? null;
+    preloads.delete(id);
+    const position = feed.indexOf(id);
+    for (const p of [...preloads.values()]) {
+        const other = feed.indexOf(p.assetId);
+        if (position >= 0 && other >= 0 && feedDistance(position, other) <= KEEP_WITHIN) continue;
+        forget(p);
     }
-    preload = null;
+    const preloaded = reuse && !reuse.failed ? (reuse.ready ? "preloaded" : "preload still downloading") : null;
 
     const { engine, protocol } = selectedEngine();
 
@@ -377,7 +499,8 @@ async function load(): Promise<void> {
         // The preload already looked this asset up. A real feed gets each
         // item's URLs with the feed itself; looking it up again here is a
         // round trip the viewer would wait through for nothing.
-        asset = reuse?.asset ?? (await fetchAsset(id));
+        asset = (reuse?.failed ? null : reuse?.asset) ?? knownAssets.get(id) ?? (await fetchAsset(id));
+        if (asset.status === "ready") knownAssets.set(id, asset);
         url = manifestURL(asset, protocol);
     } catch (error) {
         if (generation !== loadGeneration) return;
@@ -441,9 +564,15 @@ window.setInterval(() => {
 
 loadButton.addEventListener("click", () => void load());
 nextButton.addEventListener("click", () => void next());
+prevButton.addEventListener("click", () => void previous());
 // A different engine is a new session, like a new asset, so each recorded
-// session belongs to exactly one engine.
-engineSelect.addEventListener("change", () => void load());
+// session belongs to exactly one engine. Preloads were made for the old
+// engine's protocol, so they all go.
+engineSelect.addEventListener("change", () => {
+    for (const p of [...preloads.values()]) forget(p);
+    clearPreloaded();
+    void load();
+});
 assetInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") void load();
 });
@@ -452,6 +581,11 @@ levelSelect.addEventListener("change", () => {
     playback?.setLevel(index);
     log(index === -1 ? "level set to auto" : `level pinned to ${index}`);
 });
+audioSelect.addEventListener("change", () => {
+    log(`audio: switching to ${audioSelect.selectedOptions[0]?.textContent ?? ""}`);
+    playback?.selectAudio(Number(audioSelect.value));
+});
+subsSelect.addEventListener("change", () => playback?.selectText(Number(subsSelect.value)));
 
 // ?asset=<id> loads immediately, so reloading after a code change costs nothing.
 // So does ?feed=, starting at its first asset.

@@ -36,6 +36,16 @@ export interface EngineCallbacks {
     onDownload(bytes: number, seconds: number): void;
 
     onError(detail: string, fatal: boolean): void;
+
+    /**
+     * The audio and subtitle menus, and which entries are in use. Called once
+     * the manifest is read, and again whenever a choice changes. When that
+     * is depends on the engine: Shaka reports a new audio language as soon
+     * as it's chosen, hls.js once a fragment of it is buffered at the
+     * playhead, yours once its first segment is appended. None of them knows
+     * when it's heard.
+     */
+    onTracks(tracks: TrackList): void;
 }
 
 export interface EngineOptions extends EngineCallbacks {
@@ -61,10 +71,35 @@ export interface Engine {
     /** False while the viewer has pinned a level. */
     readonly autoEnabled: boolean;
 
+    /** Play this audio language: an id from onTracks. */
+    selectAudio(id: number): void;
+
+    /** Show these subtitles: an id from onTracks, or -1 to turn them off. */
+    selectText(id: number): void;
+
     /**
      * Asynchronous because detaching a MediaSource from a <video> element is.
      * Attaching a new engine to the same element before the old one has let go
      * can leave the two fighting over it.
      */
     destroy(): Promise<void>;
+}
+
+/** One choice in the audio or subtitles menu. */
+export interface TrackInfo {
+    /** What selectAudio() or selectText() takes: a position in the engine's own list. */
+    id: number;
+    /** BCP 47 tag from the manifest, such as "en" or "vi". */
+    language: string;
+    /** Text for the menu: NAME in HLS, <Label> in DASH; engines fall back on the tag without one. */
+    label: string;
+}
+
+export interface TrackList {
+    audio: TrackInfo[];
+    text: TrackInfo[];
+    /** The audio language being heard, -1 before the first is known. */
+    audioId: number;
+    /** The subtitles showing, -1 when they're off. */
+    textId: number;
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/MmedaraJ/fastforge/internal/jobs"
+	"github.com/MmedaraJ/fastforge/internal/langs"
 	"github.com/MmedaraJ/fastforge/internal/storage"
 	"github.com/MmedaraJ/fastforge/internal/store"
 	"github.com/go-chi/chi/v5"
@@ -32,6 +34,8 @@ import (
 const (
 	maxTitleBytes  = 256
 	maxUploadBytes = 5 << 30 // 5 GiB, for http.MaxBytesReader
+	// A two-hour film's subtitles are around 100 kB of WebVTT.
+	maxSubtitleBytes = 2 << 20
 )
 
 var allowedExtensions = map[string]bool{
@@ -59,11 +63,20 @@ type Asset struct {
 	AudioCodec       *string     `json:"audio_codec"`
 	AudioBitrateKbps *int        `json:"audio_bitrate_kbps"`
 	Renditions       []Rendition `json:"renditions"`
+	Tracks           []Track     `json:"tracks"`
 	HLSURL           *string     `json:"hls_url"`
 	DASHURL          *string     `json:"dash_url"`
 	Error            *string     `json:"error"`
 	CreatedAt        time.Time   `json:"created_at"`
 	UpdatedAt        time.Time   `json:"updated_at"`
+}
+
+// Track is one audio or subtitle language the asset's manifests offer.
+type Track struct {
+	Kind      string `json:"kind"` // "audio" or "subtitles"
+	Language  string `json:"language"`
+	Label     string `json:"label"`
+	IsDefault bool   `json:"default"`
 }
 
 type Rendition struct {
@@ -156,13 +169,29 @@ func makeCreateAsset(pool *pgxpool.Pool, rc *river.Client[pgx.Tx]) http.HandlerF
 		}
 
 		var (
-			title    string
-			gotTitle bool
-			assetID  = uuid.New()
-			dstPath  string
-			written  int64
-			gotFile  bool
+			title         string
+			gotTitle      bool
+			assetID       = uuid.New()
+			dstPath       string
+			written       int64
+			gotFile       bool
+			subtitleLangs = map[string]bool{} // Languages of the subtitle files received so far.
+			created       bool
 		)
+
+		// Files are written as their parts arrive, so every way out of this
+		// handler except success must remove them: a subtitle file rejected
+		// after the video was saved would otherwise leave both behind.
+		subtitlesDir := storage.SubtitlesDir(assetID.String())
+		defer func() {
+			if created {
+				return
+			}
+			os.RemoveAll(subtitlesDir)
+			if dstPath != "" {
+				os.Remove(dstPath)
+			}
+		}()
 
 		for {
 			part, err := mr.NextPart()
@@ -238,6 +267,54 @@ func makeCreateAsset(pool *pgxpool.Pool, rc *river.Client[pgx.Tx]) http.HandlerF
 				}
 
 				gotFile = true
+			case "subtitles":
+				// One WebVTT file per language, named after it: en.vtt,
+				// vi.vtt, pt-BR.vtt. Repeat the field for each language:
+				//   curl -F subtitles=@en.vtt -F subtitles=@vi.vtt ...
+				name := filepath.Base(part.FileName())
+				lang, ok := strings.CutSuffix(name, ".vtt")
+				if !ok || !langs.Valid(lang) {
+					part.Close()
+					writeJSONError(w, http.StatusBadRequest,
+						fmt.Sprintf("subtitle file %q: name it after its language, such as en.vtt or pt-BR.vtt", name))
+					return
+				}
+				lang = langs.Normalize(lang)
+				if subtitleLangs[lang] {
+					part.Close()
+					writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("two subtitle files for %q", lang))
+					return
+				}
+
+				b, err := io.ReadAll(io.LimitReader(part, maxSubtitleBytes+1))
+				if err != nil || len(b) > maxSubtitleBytes {
+					part.Close()
+					writeJSONError(w, http.StatusBadRequest,
+						fmt.Sprintf("subtitle file %q is unreadable or over %d bytes", name, maxSubtitleBytes))
+					return
+				}
+				// The packager would reject a file that isn't WebVTT, but
+				// only minutes from now, after every rung is encoded.
+				if !bytes.HasPrefix(bytes.TrimPrefix(b, []byte("\xEF\xBB\xBF")), []byte("WEBVTT")) {
+					part.Close()
+					writeJSONError(w, http.StatusBadRequest,
+						fmt.Sprintf("subtitle file %q isn't WebVTT: the first line must be WEBVTT", name))
+					return
+				}
+
+				if err := os.MkdirAll(subtitlesDir, 0o755); err != nil {
+					part.Close()
+					slog.Error("saving subtitles", "err", err, "asset_id", assetID)
+					writeJSONError(w, http.StatusInternalServerError, "saving subtitles")
+					return
+				}
+				if err := os.WriteFile(filepath.Join(subtitlesDir, lang+".vtt"), b, 0o644); err != nil {
+					part.Close()
+					slog.Error("saving subtitles", "err", err, "asset_id", assetID)
+					writeJSONError(w, http.StatusInternalServerError, "saving subtitles")
+					return
+				}
+				subtitleLangs[lang] = true
 			}
 			part.Close()
 		}
@@ -287,6 +364,8 @@ func makeCreateAsset(pool *pgxpool.Pool, rc *river.Client[pgx.Tx]) http.HandlerF
 			os.Remove(dstPath)
 			return
 		}
+
+		created = true
 
 		writeJSON(w, http.StatusCreated, createAssetResponse{
 			ID:     assetID.String(),
@@ -382,8 +461,39 @@ func makeGetAsset(pool *pgxpool.Pool, mediaBase string) http.HandlerFunc {
 			return
 		}
 
+		tracks, err := loadTracks(r.Context(), pool, assetID)
+		if err != nil {
+			slog.Error("loading tracks", "err", err, "asset_id", idStr)
+			writeJSONError(w, http.StatusInternalServerError, "failed to load asset")
+			return
+		}
+		a.Tracks = tracks
+
 		writeJSON(w, http.StatusOK, a)
 	}
+}
+
+// loadTracks lists the asset's audio and subtitle languages: audio first, the
+// default first within each kind.
+func loadTracks(ctx context.Context, pool *pgxpool.Pool, assetID uuid.UUID) ([]Track, error) {
+	rows, err := pool.Query(ctx,
+		`SELECT kind, language, label, is_default FROM tracks
+		 WHERE asset_id = $1
+		 ORDER BY kind, is_default DESC, language`, assetID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tracks := []Track{} // [] rather than null, as with renditions
+	for rows.Next() {
+		var t Track
+		if err := rows.Scan(&t.Kind, &t.Language, &t.Label, &t.IsDefault); err != nil {
+			return nil, err
+		}
+		tracks = append(tracks, t)
+	}
+	return tracks, rows.Err()
 }
 
 // withMediaCORS lets a player on another origin (the hls.js demo page) fetch

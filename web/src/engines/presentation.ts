@@ -22,10 +22,34 @@ export interface Rung {
     playlist: MediaPlaylist;
 }
 
+/** One audio language: HLS's EXT-X-MEDIA TYPE=AUDIO, DASH's audio AdaptationSet. */
+export interface AudioOption {
+    /** BCP 47 tag from the manifest: LANGUAGE in HLS, lang in DASH. "" if none. */
+    language: string;
+    /** What the viewer sees in the menu: NAME in HLS, <Label> in DASH; the tag if there's neither. */
+    label: string;
+    /** DEFAULT=YES in HLS, Role "main" in DASH: play this unless the viewer says otherwise. */
+    isDefault: boolean;
+    playlist: MediaPlaylist;
+}
+
+/** One subtitle language. Its "segments" are WebVTT text files. */
+export interface SubtitleOption {
+    language: string;
+    label: string;
+    isDefault: boolean;
+    /**
+     * FORCED=YES in HLS, Role "forced-subtitle" in DASH: lines to show even
+     * with subtitles off, such as dialogue in a language the audio doesn't use.
+     */
+    forced: boolean;
+    playlist: MediaPlaylist;
+}
+
 export interface Presentation {
     /** Lowest bandwidth first: the order every engine reports levels in. */
     rungs: Rung[];
-    audio: MediaPlaylist | null;
-    /** How many audio renditions the manifest offers, for the "N audio track(s)" log line. */
-    audioTracks: number;
+    /** Every audio language, in manifest order. Empty for a silent stream. */
+    audio: AudioOption[];
+    subtitles: SubtitleOption[];
 }

@@ -15,7 +15,26 @@ type Result struct {
 	Height     int
 	FPS        float64
 	DurationS  float64
+	// AudioCodec is the first audio stream's codec, "" for a silent source.
 	AudioCodec string
+	// AudioStreams lists every audio stream: one per language in a file
+	// delivered with dubs.
+	AudioStreams []AudioStream
+}
+
+// AudioStream is one audio track in the source.
+type AudioStream struct {
+	// Index counts audio streams only, the way FFmpeg's -map 0:a:N does: the
+	// second audio stream is 1 whatever number the video took.
+	Index int
+	Codec string
+	// Language is the container's tag, usually ISO 639-2 ("eng", "vie").
+	// "" when the file doesn't say, including when it says "und".
+	Language string
+	// Title is the container's title tag, such as "English 5.1"; often empty.
+	Title string
+	// Default is the container's "play this one" flag.
+	Default bool
 }
 
 type stream struct {
@@ -24,6 +43,10 @@ type stream struct {
 	Width      int    `json:"width"`
 	Height     int    `json:"height"`
 	RFrameRate string `json:"r_frame_rate"` // "30000/1001"
+	// Tags hold language and title. ffprobe lowercases the keys it knows,
+	// but a Matroska file can carry "LANGUAGE", so tag() ignores case.
+	Tags        map[string]string `json:"tags"`
+	Disposition map[string]int    `json:"disposition"`
 }
 
 type format struct {
@@ -33,6 +56,16 @@ type format struct {
 type ffprobeOutput struct {
 	Streams []stream `json:"streams"`
 	Format  format   `json:"format"`
+}
+
+// tag reads a stream tag whatever the case of its key.
+func (s stream) tag(key string) string {
+	for k, v := range s.Tags {
+		if strings.EqualFold(k, key) {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 func Probe(ctx context.Context, path string) (Result, error) {
@@ -102,6 +135,17 @@ func parseStreams(path string, streams []stream, result Result) (Result, error) 
 			if result.AudioCodec == "" {
 				result.AudioCodec = stream.CodecName
 			}
+			language := stream.tag("language")
+			if strings.EqualFold(language, "und") {
+				language = ""
+			}
+			result.AudioStreams = append(result.AudioStreams, AudioStream{
+				Index:    len(result.AudioStreams),
+				Codec:    stream.CodecName,
+				Language: language,
+				Title:    stream.tag("title"),
+				Default:  stream.Disposition["default"] == 1,
+			})
 		}
 	}
 

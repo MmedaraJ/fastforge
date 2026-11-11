@@ -1,15 +1,13 @@
 /**
- * Just enough HLS to play the streams your own pipeline produces: the master
- * playlist's variants and audio renditions, and each media playlist's init
- * segment and segments.
+ * Just enough HLS to play the streams your own pipeline produces: 
+ * the master playlist's variants, audio languages and subtitle languages, 
+ * and each media playlist's init segment and segments.
  *
  * Deliberately not a general parser. No live playlists, byte ranges,
  * encryption, discontinuities or I-frame playlists: your packager emits none
  * of them, and code for cases you can't test is code you can't trust.
  */
 
-/**
- */
 export interface Variant {
     /** Absolute URL of this variant's media playlist. */
     uri: string;
@@ -20,18 +18,28 @@ export interface Variant {
     codecs: string[];
     /** GROUP-ID of the audio this variant plays with, or null. */
     audioGroup: string | null;
+    /** GROUP-ID of the subtitles that go with this variant, or null. */
+    subtitleGroup: string | null;
 }
 
-export interface AudioRendition {
+/** An EXT-X-MEDIA line: one audio language or one subtitle language. */
+export interface Rendition {
     uri: string;
     groupId: string;
     name: string;
+    /** LANGUAGE: a BCP 47 tag such as "en" or "vi"; "" if absent. */
+    language: string;
+    /** DEFAULT=YES: play this one unless the viewer chooses otherwise. */
+    isDefault: boolean;
+    /** FORCED=YES, subtitles only: show even when subtitles are off. */
+    forced: boolean;
 }
 
 export interface MasterPlaylist {
     /** Lowest bandwidth first, the order every engine reports levels in. */
     variants: Variant[];
-    audio: AudioRendition[];
+    audio: Rendition[];
+    subtitles: Rendition[];
 }
 
 export interface Segment {
@@ -74,7 +82,8 @@ function resolve(uri: string, base: string): string {
 export function parseMaster(text: string, baseUrl: string): MasterPlaylist {
     const lines = text.split(/\r?\n/).map((line) => line.trim());
     const variants: Variant[] = [];
-    const audio: AudioRendition[] = [];
+    const audio: Rendition[] = [];
+    const subtitles: Rendition[] = [];
 
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
@@ -82,9 +91,19 @@ export function parseMaster(text: string, baseUrl: string): MasterPlaylist {
         if (line.startsWith("#EXT-X-MEDIA:")) {
             const a = attributes(line);
             const uri = a.get("URI");
-            if (a.get("TYPE") === "AUDIO" && uri) {
-                audio.push({ uri: resolve(uri, baseUrl), groupId: a.get("GROUP-ID") ?? "", name: a.get("NAME") ?? "" });
-            }
+            // An audio rendition without a URI is the audio muxed into the
+            // variants themselves. Your packager never writes one.
+            if (!uri) continue;
+            const rendition: Rendition = {
+                uri: resolve(uri, baseUrl),
+                groupId: a.get("GROUP-ID") ?? "",
+                name: a.get("NAME") ?? "",
+                language: a.get("LANGUAGE") ?? "",
+                isDefault: a.get("DEFAULT") === "YES",
+                forced: a.get("FORCED") === "YES",
+            };
+            if (a.get("TYPE") === "AUDIO") audio.push(rendition);
+            if (a.get("TYPE") === "SUBTITLES") subtitles.push(rendition);
             continue;
         }
 
@@ -103,12 +122,13 @@ export function parseMaster(text: string, baseUrl: string): MasterPlaylist {
             height: Number(a.get("RESOLUTION")?.split("x")[1] ?? 0),
             codecs: (a.get("CODECS") ?? "").split(",").map((c) => c.trim()).filter(Boolean),
             audioGroup: a.get("AUDIO") ?? null,
+            subtitleGroup: a.get("SUBTITLES") ?? null,
         });
         i = j;
     }
 
     variants.sort((x, y) => x.bandwidth - y.bandwidth);
-    return { variants, audio };
+    return { variants, audio, subtitles };
 }
 
 export function parseMedia(text: string, baseUrl: string): MediaPlaylist {
