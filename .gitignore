@@ -1,5 +1,6 @@
 pipeline/sources/
 pipeline/out/
 storage/
-.envtmp/
+.env
 tmp/
+.DS_Store

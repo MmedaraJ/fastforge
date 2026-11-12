@@ -27,6 +27,13 @@ The VMAF figures come from the containerized pipeline run (95.70, 91.30, 83.03).
 
 These figures come from Claude's runs of the Milestone 13 guide (same throttle, three sessions per engine, Nov 10 and 11). Move each bullet up to Ready now once it's built, with your numbers from `docs/languages.md`.
 
+## Add once Milestone 14 is built
+
+- Built content protection end to end for a video platform: per-asset content keys under AES-256-GCM envelope encryption, cbcs CENC packaging for HLS and DASH with Shaka Packager, a Go licence server behind HMAC-signed playback tokens with per-asset entitlement checks, and HMAC-signed media URLs verified at the edge by a Cloudflare Worker in front of a private R2 bucket.
+- Measured DRM's startup cost across hls.js, Shaka Player and a custom MSE/EME engine over 144 throttled cold loads: the licence round trip hid behind the first segment at 2.5 Mbit/s but added up to 1.13 s on a fast link with a slow licence server. Made hls.js request Clear Key licences from the playlist, removing a 1.1 s wait at 2.5 Mbit/s, and cut a feed swipe to an encrypted video from 1.2 s to about 0.1 s by licensing the next video ahead with detached MediaKeys sessions.
+
+These figures come from Claude's runs of the Milestone 14 guide, Step 7 (Chrome throttle 2,500 kbit/s or 50 Mbit/s and 100 ms, licence held 0 or 1 s, three loads per cell, Nov 11 and 12). Move each bullet up to Ready now once it's built, with your numbers from `docs/drm.md`.
+
 ## Add when the results are in
 
 - Compared throughput-based and BOLA-style ABR with hls.js's built-in ABR in randomized, interleaved trials on throttled networks: at ~2.15 Mbps measured, opening on the lowest rung cut median startup from 6.1 s to 4.0 s with no added rebuffering; at ~1.2 Mbps every algorithm stalled about 7% of the time, showing the ladder needed a lower rung rather than a different algorithm. Numbers from `docs/abr-results.md`; add the session count per arm from the query before using it.
