@@ -1,6 +1,8 @@
 package packager
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -183,4 +185,70 @@ func TestArgs(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestEncryptionArgs(t *testing.T) {
+	base := Job{
+		Video:          []Input{{Path: "storage/renditions/x/480p.mp4", Height: 480}},
+		OutDir:         "storage/packaged/x",
+		SegmentSeconds: 6,
+	}
+	if args := Args(base); slices.Contains(args, "--protection_scheme") {
+		t.Fatal("a clear job asked for encryption")
+	}
+
+	clear := base
+	clear.Encryption = &Encryption{
+		Mode:  ModeClearKey,
+		KeyID: [16]byte{0xaf, 0x2d}, Key: [16]byte{0x01},
+		ClearLeadSeconds: 0,
+	}
+	args := Args(clear)
+	for flag, want := range map[string]string{
+		"--protection_scheme":  "cbcs",
+		"--clear_lead":         "0",
+		"--protection_systems": "CommonSystem",
+		"--keys":               "label=:key_id=af2d0000000000000000000000000000:key=01000000000000000000000000000000",
+	} {
+		if got, _ := flagValue(args, flag); got != want {
+			t.Errorf("clearkey %s = %q, want %q", flag, got, want)
+		}
+	}
+	if !slices.Contains(args, "--enable_raw_key_encryption") {
+		t.Error("clearkey: raw key encryption not enabled")
+	}
+
+	wv := base
+	wv.Encryption = &Encryption{Mode: ModeWidevineTest, ContentID: "x", ClearLeadSeconds: 5}
+	args = Args(wv)
+	if got, _ := flagValue(args, "--content_id"); got != "78" { // hex of "x"
+		t.Errorf("widevine content_id = %q, want 78", got)
+	}
+	if got, _ := flagValue(args, "--protection_systems"); got != "Widevine" {
+		t.Errorf("widevine protection_systems = %q", got)
+	}
+	if slices.Contains(args, "--keys") {
+		t.Error("widevine-test must not pass raw keys: Google's key server supplies them")
+	}
+}
+
+func TestMarkClearKey(t *testing.T) {
+	dir := t.TempDir()
+	playlist := "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n" +
+		"#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"data:text/plain;base64,ry0dVNHu2h8AaHfX/eBtVg==\",IV=0x01,KEYFORMAT=\"identity\"\n" +
+		"#EXTINF:6.000,\n1.m4s\n"
+	os.MkdirAll(filepath.Join(dir, "720p"), 0o755)
+	os.WriteFile(filepath.Join(dir, "720p", "index.m3u8"), []byte(playlist), 0o644)
+	os.WriteFile(filepath.Join(dir, "master.m3u8"), []byte("#EXTM3U\n"), 0o644)
+
+	if err := markClearKey(dir); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "720p", "index.m3u8"))
+	if !strings.Contains(string(got), `KEYFORMAT="org.w3.clearkey"`) || strings.Contains(string(got), `"identity"`) {
+		t.Errorf("not relabelled:\n%s", got)
+	}
+	if strings.Count(string(got), "\n") != strings.Count(playlist, "\n") {
+		t.Error("relabelling changed more than the key format")
+	}
 }

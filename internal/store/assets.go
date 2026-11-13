@@ -104,11 +104,13 @@ func SetProgressStage(ctx context.Context, pool *pgxpool.Pool, assetID, stage st
 	return nil
 }
 
-// SavePackaging records where the packaged manifests live.
-func SavePackaging(ctx context.Context, pool *pgxpool.Pool, assetID, hlsPath, dashPath string) error {
+// SavePackaging records where the packaged manifests live and how the asset
+// is encrypted: "clearkey", "widevine-test", or "" for clear.
+func SavePackaging(ctx context.Context, pool *pgxpool.Pool, assetID, hlsPath, dashPath, drm string) error {
+	// NULLIF: an empty drm is a clear asset, stored as NULL.
 	tag, err := pool.Exec(ctx,
-		`UPDATE assets SET hls_path=$1, dash_path=$2, updated_at=now()
-		 WHERE id=$3 AND status='processing'`, hlsPath, dashPath, assetID)
+		`UPDATE assets SET hls_path=$1, dash_path=$2, drm=NULLIF($3, ''), updated_at=now()
+		 WHERE id=$4 AND status='processing'`, hlsPath, dashPath, drm, assetID)
 	if err != nil {
 		return fmt.Errorf("saving packaging paths: %w", err)
 	}

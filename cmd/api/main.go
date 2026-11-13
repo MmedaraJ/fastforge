@@ -64,11 +64,12 @@ type Asset struct {
 	AudioBitrateKbps *int        `json:"audio_bitrate_kbps"`
 	Renditions       []Rendition `json:"renditions"`
 	Tracks           []Track     `json:"tracks"`
-	HLSURL           *string     `json:"hls_url"`
-	DASHURL          *string     `json:"dash_url"`
-	Error            *string     `json:"error"`
-	CreatedAt        time.Time   `json:"created_at"`
-	UpdatedAt        time.Time   `json:"updated_at"`
+	// "clearkey", "widevine-test" or null. Playable URLs come only from
+	// POST /assets/{id}/playback, signed for that viewer.
+	DRM       *string   `json:"drm"`
+	Error     *string   `json:"error"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Track is one audio or subtitle language the asset's manifests offer.
@@ -376,7 +377,7 @@ func makeCreateAsset(pool *pgxpool.Pool, rc *river.Client[pgx.Tx]) http.HandlerF
 
 // URLParam → QueryRow → Scan into your Asset struct →
 // errors.Is(err, pgx.ErrNoRows) → 404, else 200 JSON.
-func makeGetAsset(pool *pgxpool.Pool, mediaBase string) http.HandlerFunc {
+func makeGetAsset(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		idStr := chi.URLParam(r, "id")
 
@@ -387,18 +388,17 @@ func makeGetAsset(pool *pgxpool.Pool, mediaBase string) http.HandlerFunc {
 		}
 
 		var a Asset
-		var hlsPath, dashPath *string
 
 		err = pool.QueryRow(r.Context(),
 			`SELECT id, title, status, video_codec, width, height, duration_s, fps,
-			        audio_codec, audio_bitrate_kbps, error, created_at, updated_at, hls_path, dash_path
+			        audio_codec, audio_bitrate_kbps, error, created_at, updated_at, drm
 			 FROM assets
 			 WHERE id = $1`,
 			assetID,
 		).Scan(
 			&a.ID, &a.Title, &a.Status, &a.VideoCodec, &a.Width, &a.Height,
 			&a.DurationS, &a.FPS, &a.AudioCodec, &a.AudioBitrateKbps, &a.Error, &a.CreatedAt, &a.UpdatedAt,
-			&hlsPath, &dashPath,
+			&a.DRM,
 		)
 
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -410,18 +410,6 @@ func makeGetAsset(pool *pgxpool.Pool, mediaBase string) http.HandlerFunc {
 			slog.Error("querying asset", "err", err, "asset_id", idStr)
 			writeJSONError(w, http.StatusInternalServerError, "failed to load asset")
 			return
-		}
-
-		// The database stores a storage path; the API publishes a URL. Keeping
-		// those separate means the disk layout can change without breaking the
-		// contract — and when these files move to a CDN, only this bit changes.
-		if hlsPath != nil {
-			u := mediaBase + "/" + strings.TrimPrefix(*hlsPath, "storage/")
-			a.HLSURL = &u
-		}
-		if dashPath != nil {
-			u := mediaBase + "/" + strings.TrimPrefix(*dashPath, "storage/")
-			a.DASHURL = &u
 		}
 
 		rows, err := pool.Query(r.Context(),
@@ -577,15 +565,29 @@ func main() {
 	// routing: build the dispatcher and register handlers
 	r := chi.NewRouter()
 	r.Post("/assets", makeCreateAsset(pool, riverClient))
-	r.Get("/assets/{id}", makeGetAsset(pool, mediaBase))
-	r.With(withAPICORS).Get("/assets/{id}", makeGetAsset(pool, mediaBase))
+	r.With(withAPICORS).Get("/assets/{id}", makeGetAsset(pool))
 	r.With(withAPICORS).Post("/beacons", makeCreateBeacon(pool))
+
+	// Milestone 14: playback starts with signed URLs and, for an encrypted
+	// asset, a token for the licence endpoints.
+	playback := newPlaybackServer(pool, mediaBase)
+	r.Group(func(r chi.Router) {
+		r.Use(withPlaybackCORS)
+		for _, path := range []string{"/assets/{id}/playback", "/license/clearkey", "/license/widevine"} {
+			r.Options(path, func(http.ResponseWriter, *http.Request) {}) // withPlaybackCORS answers
+		}
+		r.Post("/assets/{id}/playback", playback.start)
+		r.Post("/license/clearkey", playback.clearKey)
+		r.Post("/license/widevine", playback.widevine)
+	})
+
 	// Dev only. In production these bytes come from a CDN, and this route
 	// disappears. http.FileServer returns a Handler; StripPrefix wraps one
-	// and returns another; withMediaCORS wraps that. Three decorators,
-	// same shape as a Reader wrapping a Reader.
+	// and returns another; withMediaCORS wraps that. Same shape as a Reader
+	// wrapping a Reader. requireSignedURL makes the same check the Cloudflare
+	// Worker makes in production, so an unsigned URL fails here too.
 	media := http.FileServer(http.Dir("storage"))
-	r.Handle("/media/*", withMediaCORS(withMediaHeaders(http.StripPrefix("/media/", media))))
+	r.Handle("/media/*", withMediaCORS(withMediaHeaders(http.StripPrefix("/media/", playback.requireSignedURL(media)))))
 
 	srv := &http.Server{Addr: ":8080", Handler: r}
 

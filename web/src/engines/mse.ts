@@ -1,9 +1,10 @@
 import type { MediaPlaylist } from "./hls/playlist";
 import { readPresentation } from "./manifest";
-import { takePreloaded } from "./preload";
-import type { AudioOption, Rung, SubtitleOption } from "./presentation";
+import { takePreloaded, takePreparedKeys } from "./preload";
+import { mimeFor, type AudioOption, type Rung, type SubtitleOption } from "./presentation";
 import type { Engine, EngineOptions, LevelInfo } from "./types";
 import { parseVtt, type Cue } from "./webvtt";
+import { Eme } from "./eme";
 
 /*
  * fastforge's own engine: HLS or DASH played straight through Media Source
@@ -123,6 +124,8 @@ export class MseEngine implements Engine {
     private textBusy = false;
 
     private mediaSource: MediaSource | null = null;
+    /** Set for an encrypted asset. */
+    private eme: Eme | null = null;
     private objectUrl = "";
     private tracks: Track[] = [];
     private timer = 0;
@@ -184,6 +187,18 @@ export class MseEngine implements Engine {
         // requested. player.ts calls start() from inside this callback, which
         // sets the rendition the first segment will come from.
         this.opts.onManifest(levels, presentation.audio.length);
+
+        if (this.opts.drm) {
+            // Before attach(): the CDM has to be on the element before the
+            // first encrypted init segment is appended.
+            this.eme = new Eme(this.video, this.opts.drm, (detail) => this.fail(new Error(detail)));
+            const videoTypes = [...new Set(this.rungs.map((rung) => mimeFor(rung, "video")))];
+            // A licence the preloader already fetched, or is still fetching:
+            // waiting for that beats starting a second one.
+            const prepared = await (takePreparedKeys(url) ?? Promise.resolve(null)).catch(() => null);
+            await this.eme.attach(videoTypes, this.audioOptions.length > 0 ? mimeFor(this.rungs[this.desired], "audio") : null, prepared);
+            if (this.destroyed) return;
+        }
 
         await this.attach();
         if (this.destroyed) return;
@@ -263,6 +278,10 @@ export class MseEngine implements Engine {
         this.video.load();
         this.mediaSource = null;
         this.tracks = [];
+        // After the MediaSource is gone: keys come off an element that has
+        // nothing left to decrypt.
+        await this.eme?.destroy();
+        this.eme = null;
     }
 
     // ---------------------------------------------------------------------
@@ -815,14 +834,6 @@ export class MseEngine implements Engine {
         const message = error instanceof Error ? error.message : String(error);
         this.opts.onError(message.startsWith("mse:") ? message : `mse: ${message}`, true);
     }
-}
-
-/** `video/mp4; codecs="avc1.640028"` or `audio/mp4; codecs="mp4a.40.2"` from a rung's codecs. */
-function mimeFor(rung: Rung, kind: "video" | "audio"): string {
-    const video = /^(avc1|avc3|hvc1|hev1|av01|vp09)\./;
-    const codec = rung.codecs.find((c) => (kind === "video" ? video.test(c) : !video.test(c)));
-    if (!codec) throw new Error(`mse: the ${rung.height}p rung lists no ${kind} codec`);
-    return `${kind}/mp4; codecs="${codec}"`;
 }
 
 /** Seconds buffered ahead of `time` in the range that contains it. */

@@ -65,13 +65,14 @@ interface ShakaPlayer {
     getTextTracks(): ShakaTextTrack[];
     selectTextTrack(track: ShakaTextTrack | null): void;
     getNetworkingEngine(): {
-        registerRequestFilter(filter: (type: number, request: { uris: string[] }) => void): void;
+        registerRequestFilter(filter: (type: number, request: { uris: string[]; headers: Record<string, string> }) => void): void;
         registerResponseFilter(filter: (type: number, response: ShakaResponse) => void): void;
     } | null;
     addEventListener(type: string, listener: (event: Event) => void): void;
 }
 
 const SEGMENT_REQUEST: number = shaka.net.NetworkingEngine.RequestType.SEGMENT;
+const LICENSE_REQUEST: number = shaka.net.NetworkingEngine.RequestType.LICENSE;
 const CRITICAL: number = shaka.util.Error.Severity.CRITICAL;
 
 /**
@@ -259,6 +260,11 @@ export class ShakaEngine implements Engine {
         // just in code, so any comparison between them mixed the two.
         this.player.configure({ streaming: { bufferingGoal: 30 } });
 
+        // DRM. Shaka reads the key systems the manifest offers and uses the
+        // first one it has a licence server for. It plays Clear Key from
+        // DASH only: in HLS it accepts no Clear Key KEYFORMAT (error 4026).
+        if (opts.drm) this.player.configure({ drm: { servers: { [opts.drm.keySystem]: opts.drm.licenseUrl } } });
+
         // Only install the custom manager when your algorithm is in charge.
         // Otherwise Shaka keeps its built-in ABR, which is the control arm.
         this.manager = opts.ownAbr
@@ -283,6 +289,8 @@ export class ShakaEngine implements Engine {
 
         // A request filter runs just before a request goes out.
         net?.registerRequestFilter((type, request) => {
+            // The viewer's token, on licence requests only.
+            if (type === LICENSE_REQUEST && opts.drm) request.headers["Authorization"] = `Bearer ${opts.drm.token}`;
             if (type === SEGMENT_REQUEST && isVideoMedia(request.uris[0] ?? "")) this.videoInFlight = true;
         });
 

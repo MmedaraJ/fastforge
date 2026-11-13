@@ -1,11 +1,11 @@
 import "./style.css";
-import type { Asset, EngineName, Playback, PlayerEvent, Protocol, TrackInfo } from "./player";
+import type { Asset, EngineName, Playback, PlayerEvent, Protocol, TrackInfo, PlaybackInfo } from "./player";
 import { reportOnExit, reportSession, sendBeacon } from "./beacon";
 import { runExperiment } from "./experiment";
 import type { QoESnapshot } from "./qoe";
 import { ALGORITHMS } from "./abr";
 import { CAN_SELECT_LEVEL, clearPreloaded, dropPreloaded, fetchAsset, manifestURL, 
-    play, playsHlsNatively, preloadStart } from "./player";
+    play, playsHlsNatively, preloadStart, drmConfig, startPlayback } from "./player";
 
 const el = <T extends HTMLElement>(id: string): T =>
     document.getElementById(id) as T;
@@ -121,6 +121,8 @@ interface Preload {
     asset: Asset | null;
     ready: boolean;
     failed: boolean;
+    /** Its signed URLs and licence token, minted when the preload began. */
+    playback: PlaybackInfo | null;
 }
 
 /** Every preload kept, by asset id. */
@@ -160,7 +162,7 @@ function maybePreload(s: QoESnapshot): void {
 
 async function startPreload(assetId: string, protocol: Protocol): Promise<void> {
     const controller = new AbortController();
-    const mine: Preload = { assetId, manifestUrl: null, controller, asset: null, ready: false, failed: false };
+    const mine: Preload = { assetId, manifestUrl: null, controller, asset: null, ready: false, failed: false, playback: null };
     preloads.set(assetId, mine);
     const started = performance.now();
     log(`preloading next: ${assetId}`);
@@ -168,8 +170,11 @@ async function startPreload(assetId: string, protocol: Protocol): Promise<void> 
         const asset = knownAssets.get(assetId) ?? (await fetchAsset(assetId));
         if (asset.status === "ready") knownAssets.set(assetId, asset);
         mine.asset = asset;
-        mine.manifestUrl = manifestURL(asset, protocol);
-        const bytes = await preloadStart(mine.manifestUrl, controller.signal);
+        // The preload and the playback it becomes must use the same signed
+        // URLs: the preload store is keyed by URL.
+        mine.playback = await startPlayback(assetId);
+        mine.manifestUrl = manifestURL(mine.playback, protocol);
+        const bytes = await preloadStart(mine.manifestUrl, controller.signal, drmConfig(mine.playback));
         if (preloads.get(assetId) !== mine) return;
         mine.ready = true;
         log(`preloaded ${assetId}: ${Math.round(bytes / 1000)} kB in ${((performance.now() - started) / 1000).toFixed(2)} s`);
@@ -494,14 +499,16 @@ async function load(): Promise<void> {
     const { engine, protocol } = selectedEngine();
 
     let asset: Asset;
+    let info: PlaybackInfo;
     let url: string;
     try {
-        // The preload already looked this asset up. A real feed gets each
-        // item's URLs with the feed itself; looking it up again here is a
-        // round trip the viewer would wait through for nothing.
+        // The preload already looked this asset up and started its playback.
+        // A real feed gets each item's URLs with the feed itself; asking again
+        // here is a round trip the viewer would wait through for nothing.
         asset = (reuse?.failed ? null : reuse?.asset) ?? knownAssets.get(id) ?? (await fetchAsset(id));
         if (asset.status === "ready") knownAssets.set(id, asset);
-        url = manifestURL(asset, protocol);
+        info = (reuse?.failed ? null : reuse?.playback) ?? (await startPlayback(id));
+        url = manifestURL(info, protocol);
     } catch (error) {
         if (generation !== loadGeneration) return;
         log((error as Error).message, "er");
@@ -537,6 +544,7 @@ async function load(): Promise<void> {
         protocol,
         abr: ALGORITHMS[abrSelect.value],
         networkProfile,
+        drm: drmConfig(info),
         onEvent: onPlayerEvent,
     });
 

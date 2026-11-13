@@ -48,12 +48,28 @@ export interface EngineCallbacks {
     onTracks(tracks: TrackList): void;
 }
 
+/**
+ * What an encrypted asset needs to play, from POST /assets/{id}/playback.
+ * The engine is given it, rather than finding it in the manifest, because
+ * the token belongs to this viewer and this playback, not to the asset.
+ */
+export interface DrmConfig {
+    /** The EME name: "org.w3.clearkey" or "com.widevine.alpha". */
+    keySystem: string;
+    /** Absolute. Where the CDM's licence requests go. */
+    licenseUrl: string;
+    /** Sent as "Authorization: Bearer <token>" with every licence request. */
+    token: string;
+}
+
 export interface EngineOptions extends EngineCallbacks {
     /**
      * True when your own ABR algorithm chooses renditions. False means the
      * engine's built-in ABR does, which is the control arm of experiments.
      */
     ownAbr: boolean;
+    /** Null for a clear asset. */
+    drm: DrmConfig | null;
 }
 
 export interface Engine {

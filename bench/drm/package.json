@@ -1,0 +1,11 @@
+{
+  "name": "fastforge-bench-drm",
+  "private": true,
+  "description": "Milestone 14, Step 7: what DRM costs at startup. Playwright scripts against the running API and web app.",
+  "scripts": {
+    "setup": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
+}

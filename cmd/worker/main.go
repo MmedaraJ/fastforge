@@ -16,6 +16,8 @@ import (
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 
+	"github.com/MmedaraJ/fastforge/internal/contentkey"
+	"github.com/MmedaraJ/fastforge/internal/packager"
 	"github.com/MmedaraJ/fastforge/internal/storage"
 	"github.com/MmedaraJ/fastforge/internal/store"
 	"github.com/MmedaraJ/fastforge/internal/worker"
@@ -63,6 +65,25 @@ func main() {
 		log.Println("publishing locally (no R2 configured)")
 	}
 
+	// DRM fails closed: a mode that needs a KEK refuses to start without a
+	// valid one, rather than quietly packaging content in the clear.
+	drmMode := os.Getenv("DRM_MODE")
+	var keys *contentkey.Wrapper
+	switch drmMode {
+	case "":
+		log.Println("packaging clear (DRM_MODE is empty)")
+	case packager.ModeClearKey:
+		keys, err = contentkey.NewWrapper(os.Getenv("CONTENT_KEK"))
+		if err != nil {
+			log.Fatalf("DRM_MODE=clearkey: %v", err)
+		}
+		log.Println("encrypting with your own content keys")
+	case packager.ModeWidevineTest:
+		log.Println("encrypting with Google's Widevine TEST key server: development only")
+	default:
+		log.Fatalf("DRM_MODE %q is not clearkey, widevine-test or empty", drmMode)
+	}
+
 	// --- where the worker diverges from the API ---
 
 	// 1. The registry: maps Kind() strings → worker types.
@@ -72,6 +93,8 @@ func main() {
 	river.AddWorker(workers, &worker.TranscodeWorker{
 		Pool:     pool,
 		Uploader: uploader,
+		DRM:      drmMode,
+		Keys:     keys,
 	})
 
 	// 2. A CONSUMING client. The API's client had no Queues and no

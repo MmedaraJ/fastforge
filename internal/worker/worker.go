@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MmedaraJ/fastforge/internal/contentkey"
 	"github.com/MmedaraJ/fastforge/internal/jobs"
 	"github.com/MmedaraJ/fastforge/internal/ladder"
 	"github.com/MmedaraJ/fastforge/internal/langs"
@@ -28,7 +29,17 @@ type TranscodeWorker struct {
 	river.WorkerDefaults[jobs.TranscodeArgs]
 	Pool     *pgxpool.Pool
 	Uploader storage.Uploader
+	// DRM is DRM_MODE: packager.ModeClearKey, packager.ModeWidevineTest, or
+	// "" to package clear.
+	DRM string
+	// Keys wraps content keys. Set whenever DRM is ModeClearKey.
+	Keys *contentkey.Wrapper
 }
+
+// clearLeadSeconds leaves the start of every asset unencrypted, so the first
+// frame needn't wait for the licence. 0 encrypts everything; Step 7 measures
+// what that costs.
+const clearLeadSeconds = 0
 
 // packagedDir is the single definition of where an asset's packaged output
 // goes, matching renditionDir.
@@ -114,16 +125,21 @@ func (w *TranscodeWorker) process(ctx context.Context, id, storagePath string) e
 	if err := store.SetProgressStage(ctx, w.Pool, id, "packaging"); err != nil {
 		return err
 	}
+	encryption, err := w.encryption(ctx, id)
+	if err != nil {
+		return err
+	}
 	hlsPath, dashPath, err := w.packageAsset(ctx, id, packager.Job{
 		Video:           produced,
 		Audio:           audio,
 		Subtitles:       subtitles,
 		DefaultLanguage: defaultLanguage,
+		Encryption:      encryption,
 	})
 	if err != nil {
 		return err
 	}
-	if err := store.SavePackaging(ctx, w.Pool, id, hlsPath, dashPath); err != nil {
+	if err := store.SavePackaging(ctx, w.Pool, id, hlsPath, dashPath, w.DRM); err != nil {
 		return err
 	}
 	// Recorded only now: these are the tracks the manifests actually offer.
@@ -347,6 +363,35 @@ func (w *TranscodeWorker) encodeAudio(ctx context.Context, id, srcPath string, s
 	slog.Info("audio encoded", "asset_id", id, "stream", stream,
 		"bitrate_kbps", track.BitrateKbps, "bytes", info.Size(), "path", dst)
 	return dst, nil
+}
+
+// encryption decides how this asset is encrypted, fetching or making its
+// content key first. Nil for a clear asset.
+func (w *TranscodeWorker) encryption(ctx context.Context, id string) (*packager.Encryption, error) {
+	switch w.DRM {
+	case "":
+		return nil, nil
+	case packager.ModeWidevineTest:
+		return &packager.Encryption{Mode: w.DRM, ContentID: id, ClearLeadSeconds: clearLeadSeconds}, nil
+	}
+
+	// Clear Key: one key per asset, made on the first attempt and kept. A
+	// retry that made a new key would leave anything already uploaded under
+	// the old one.
+	key := contentkey.New()
+	keyID, wrapped, err := store.SaveContentKey(ctx, w.Pool, id, key.ID, w.Keys.Wrap(id, key))
+	if err != nil {
+		return nil, err
+	}
+	// Unwrapping what's stored, rather than using the key just made, is
+	// what makes a retry reuse the first attempt's key.
+	key, err = w.Keys.Unwrap(id, keyID, wrapped)
+	if err != nil {
+		return nil, err
+	}
+	// The key ID is public, so it may be logged. The key, never.
+	slog.Info("content key ready", "asset_id", id, "key_id", fmt.Sprintf("%x", key.ID))
+	return &packager.Encryption{Mode: w.DRM, KeyID: key.ID, Key: key.Value, ClearLeadSeconds: clearLeadSeconds}, nil
 }
 
 // packageAsset fills in where the output goes and how long segments are,

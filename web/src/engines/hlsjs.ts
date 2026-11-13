@@ -1,16 +1,56 @@
-import Hls from "hls.js";
-import type { Engine, EngineOptions, LevelInfo, TrackInfo } from "./types";
+import Hls, { type GenerateRequestFilterResult, type HlsConfig, type LevelKey } from "hls.js";
+import type { DrmConfig, Engine, EngineOptions, LevelInfo, TrackInfo } from "./types";
+
+/**
+ * hls.js's DRM settings. It picks the key system from the playlist's
+ * KEYFORMAT, asks EME for it, and posts the CDM's licence request to
+ * licenseUrl; licenseXhrSetup adds the viewer's token to that request.
+ */
+function drmSettings(drm: DrmConfig | null): Partial<HlsConfig> {
+    if (!drm) return {};
+    const clearKey = drm.keySystem === "org.w3.clearkey";
+    return {
+        emeEnabled: true,
+        // Keyed by key system name; hls.js types the key as its own enum.
+        drmSystems: {
+            [drm.keySystem]: { licenseUrl: drm.licenseUrl, generateRequest: clearKey ? keyIdsFromPlaylist : undefined },
+        } as HlsConfig["drmSystems"],
+        licenseXhrSetup: (xhr) => xhr.setRequestHeader("Authorization", `Bearer ${drm.token}`),
+    };
+}
+
+/**
+ * Clear Key's licence request, built from the key ID in the playlist.
+ *
+ * hls.js reads the key ID from a Clear Key KEY tag but finds no PSSH box
+ * there (a Widevine KEY tag's URI is one), so it skips the request and waits
+ * for the browser's "encrypted" event. That event comes when the init
+ * segment is appended, and hls.js appends it along with the first media
+ * segment: in Step 7 the licence went out 65-75 ms after the first video
+ * segment had downloaded. A "keyids" request needs only the key ID, so with
+ * it hls.js asks while the segment is still on its way.
+ */
+function keyIdsFromPlaylist(
+    initDataType: string,
+    initData: ArrayBuffer | null,
+    { decryptdata }: { decryptdata: LevelKey },
+): GenerateRequestFilterResult {
+    if (initData || !decryptdata.keyId) return { initDataType, initData };
+    const kid = btoa(String.fromCharCode(...decryptdata.keyId)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    return { initDataType: "keyids", initData: new TextEncoder().encode(JSON.stringify({ kids: [kid] })).buffer };
+}
 
 export class HlsJsEngine implements Engine {
-    // autoStartLoad: false, so hls.js reads the manifest and then waits for
-    // start(). That's how the opening level gets chosen deliberately.
-    private readonly hls = new Hls({ autoStartLoad: false });
+    private readonly hls: Hls;
     private readonly video;
     private readonly opts: EngineOptions;
 
     constructor(video: HTMLVideoElement, opts: EngineOptions) {
         this.video = video;
         this.opts = opts;
+        // autoStartLoad: false, so hls.js reads the manifest and then waits for
+        // start(). That's how the opening level gets chosen deliberately.
+        this.hls = new Hls({ autoStartLoad: false, ...drmSettings(opts.drm) });
         const { hls } = this;
 
         // Subtitles start off until the viewer turns them on. hls.js shows a

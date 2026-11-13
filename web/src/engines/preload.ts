@@ -1,4 +1,7 @@
+import { prepareKeys, psshBoxes, type PreparedKeys } from "./eme";
 import { readPresentation } from "./manifest";
+import { mimeFor } from "./presentation";
+import type { DrmConfig } from "./types";
 
 /*
  * The next item in a feed, downloaded while the current one plays.
@@ -24,6 +27,13 @@ interface Entry {
 
 const store = new Map<string, Entry>();
 
+/**
+ * Licences fetched ahead, by manifest URL. An encrypted video's first frame
+ * waits for its licence as well as its bytes, so preloading only the bytes
+ * would leave a licence round trip after the swipe.
+ */
+const licences = new Map<string, Promise<PreparedKeys>>();
+
 /** Start a download now and keep it. Asking for the same URL again reuses the first download. */
 function keep(url: string, owner: string, signal: AbortSignal): Promise<ArrayBuffer> {
     const existing = store.get(url);
@@ -44,10 +54,11 @@ function keep(url: string, owner: string, signal: AbortSignal): Promise<ArrayBuf
 const decoder = new TextDecoder();
 
 /**
- * Download what the MSE engine needs for the first frame of `manifestUrl`.
- * Resolves with the media bytes kept, once everything has arrived.
+ * Download what the MSE engine needs for the first frame of `manifestUrl`,
+ * and for an encrypted video, its licence. Resolves with the media bytes
+ * kept, once everything has arrived.
  */
-export async function preloadStart(manifestUrl: string, signal: AbortSignal): Promise<number> {
+export async function preloadStart(manifestUrl: string, signal: AbortSignal, drm: DrmConfig | null = null): Promise<number> {
     const presentation = await readPresentation(manifestUrl, async (url) => decoder.decode(await keep(url, manifestUrl, signal)));
 
     // Rung 0, because that's where every opening lands: your algorithms open
@@ -63,8 +74,43 @@ export async function preloadStart(manifestUrl: string, signal: AbortSignal): Pr
         audio?.playlist.segments[0]?.uri,
     ].filter((url): url is string => Boolean(url));
 
-    const files = await Promise.all(urls.map((url) => keep(url, manifestUrl, signal)));
-    return files.reduce((total, bytes) => total + bytes.byteLength, 0);
+    const files = Promise.all(urls.map((url) => keep(url, manifestUrl, signal)));
+
+    // The licence starts as soon as the video init segment is in, while the
+    // first segments are still on their way: its PSSH boxes are the request.
+    const initUri = rung?.playlist.initUri;
+    const licence = drm && rung && initUri
+        ? keep(initUri, manifestUrl, signal).then((init) => {
+              const pssh = psshBoxes(init);
+              if (!pssh) return; // a clear asset after all
+              const videoTypes = [...new Set(presentation.rungs.map((r) => mimeFor(r, "video")))];
+              const prepared = prepareKeys(drm, videoTypes, audio ? mimeFor(rung, "audio") : null, pssh);
+              licences.set(manifestUrl, prepared);
+              // Like a failed download, a failed licence must never fail the
+              // real load: forget it, and the engine asks for its own.
+              return prepared.then(
+                  () => {},
+                  () => {
+                      if (licences.get(manifestUrl) === prepared) licences.delete(manifestUrl);
+                  },
+              );
+          })
+        : null;
+
+    const [kept] = await Promise.all([files, licence]);
+    return kept.reduce((total, bytes) => total + bytes.byteLength, 0);
+}
+
+/** The licence preloaded for `manifestUrl`, taken out of the store. Null if none. */
+export function takePreparedKeys(manifestUrl: string): Promise<PreparedKeys> | null {
+    const prepared = licences.get(manifestUrl) ?? null;
+    licences.delete(manifestUrl);
+    return prepared;
+}
+
+/** Close a preloaded licence's sessions: nothing will play it now. */
+function release(prepared: Promise<PreparedKeys> | undefined): void {
+    prepared?.then(({ sessions }) => sessions.forEach((session) => void session.close())).catch(() => {});
 }
 
 /**
@@ -82,9 +128,13 @@ export function dropPreloaded(manifestUrl: string): void {
     for (const [url, entry] of store) {
         if (entry.owner === manifestUrl) store.delete(url);
     }
+    release(licences.get(manifestUrl));
+    licences.delete(manifestUrl);
 }
 
 /** Forget everything preloaded. */
 export function clearPreloaded(): void {
     store.clear();
+    for (const prepared of licences.values()) release(prepared);
+    licences.clear();
 }

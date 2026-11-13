@@ -1,8 +1,11 @@
 package packager
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,6 +57,77 @@ type Job struct {
 	DefaultLanguage string
 	OutDir          string
 	SegmentSeconds  int
+	// Encryption is nil for a clear asset.
+	Encryption *Encryption
+}
+
+// The two ways an asset can be encrypted. The same words are DRM_MODE's
+// values and assets.drm's.
+const (
+	// ModeClearKey: your key, from your key store, licensed by your server.
+	ModeClearKey = "clearkey"
+	// ModeWidevineTest: a key from Google's Widevine test key server,
+	// licensed by Google's test licence server. Development only.
+	ModeWidevineTest = "widevine-test"
+)
+
+// Google's public test credentials, printed in Shaka Packager's Widevine
+// tutorial. They let anyone get test keys, which is exactly why they can
+// only ever protect test content.
+const (
+	widevineTestKeyServer  = "https://license.uat.widevine.com/cenc/getcontentkey/widevine_test"
+	widevineTestSigner     = "widevine_test"
+	widevineTestSigningKey = "1ae8ccd0e7985cc0b6203a55855a1034afc252980e970ca90e5202689f947ab9"
+	widevineTestSigningIV  = "d58ce954203b7c9a9a9d467f59839249"
+)
+
+// Encryption says how to encrypt a job.
+type Encryption struct {
+	Mode string
+	// ModeClearKey: the content key and its ID.
+	KeyID, Key [16]byte
+	// ModeWidevineTest: names the content to Google's key server, which
+	// derives the key from it. The asset ID.
+	ContentID string
+	// Seconds at the start left unencrypted, so playback can begin before
+	// the licence arrives. Rounded up to whole segments by the packager.
+	ClearLeadSeconds int
+}
+
+// encryptionArgs is the packager's half of DRM: which scheme, which key,
+// which PSSH boxes to write.
+func encryptionArgs(e *Encryption) []string {
+	args := []string{
+		// cbcs, the one scheme Widevine, PlayReady and FairPlay all decrypt,
+		// so one set of files serves every DRM system and both formats.
+		"--protection_scheme", "cbcs",
+		"--clear_lead", strconv.Itoa(e.ClearLeadSeconds),
+	}
+	switch e.Mode {
+	case ModeClearKey:
+		return append(args,
+			"--enable_raw_key_encryption",
+			// An empty label applies the key to every audio and video stream.
+			// This argument is the one place the key exists outside the key
+			// store: on the packager's command line while it runs, readable
+			// only inside the worker's container. Never log args.
+			"--keys", fmt.Sprintf("label=:key_id=%x:key=%x", e.KeyID, e.Key),
+			// CommonSystem writes the W3C common PSSH (a list of key IDs),
+			// which is what a Clear Key CDM reads.
+			"--protection_systems", "CommonSystem",
+		)
+	case ModeWidevineTest:
+		return append(args,
+			"--enable_widevine_encryption",
+			"--key_server_url", widevineTestKeyServer,
+			"--content_id", hex.EncodeToString([]byte(e.ContentID)),
+			"--signer", widevineTestSigner,
+			"--aes_signing_key", widevineTestSigningKey,
+			"--aes_signing_iv", widevineTestSigningIV,
+			"--protection_systems", "Widevine",
+		)
+	}
+	return nil
 }
 
 // Args builds the Shaka Packager argument list. Pure: no exec, no filesystem,
@@ -138,6 +212,11 @@ func Args(j Job) []string {
 			"--default_text_language", "zxx",
 		)
 	}
+
+	if j.Encryption != nil {
+		args = append(args, encryptionArgs(j.Encryption)...)
+	}
+
 	return args
 }
 
@@ -183,6 +262,9 @@ func Run(ctx context.Context, j Job) error {
 	if len(j.Video) == 0 {
 		return fmt.Errorf("packaging: no renditions to package")
 	}
+	if e := j.Encryption; e != nil && e.Mode != ModeClearKey && e.Mode != ModeWidevineTest {
+		return fmt.Errorf("packaging: unknown encryption mode %q", e.Mode)
+	}
 
 	dirs := []string{j.OutDir}
 	for _, in := range j.Video {
@@ -214,5 +296,35 @@ func Run(ctx context.Context, j Job) error {
 		}
 		return fmt.Errorf("shaka packager: %w: %s", err, tail)
 	}
+	if e := j.Encryption; e != nil && e.Mode == ModeClearKey {
+		return markClearKey(j.OutDir)
+	}
+
 	return nil
+}
+
+// markClearKey relabels the HLS key lines of a Clear Key asset.
+//
+// For the common system, Shaka Packager writes each media playlist's key as
+// KEYFORMAT="identity" with the key ID in a data: URI. "identity" means the
+// URI holds the key itself, so players read it differently: hls.js refuses
+// identity in fMP4, and Shaka Player decrypts with the key ID as if it were
+// the key. HLS has no standard Clear Key KEYFORMAT; "org.w3.clearkey", with
+// the key ID in the URI, is hls.js's convention, and the one your MSE engine
+// reads. Shaka Player doesn't accept it, so it plays Clear Key over DASH only.
+func markClearKey(dir string) error {
+	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != "index.m3u8" {
+			return err
+		}
+		playlist, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		relabelled := bytes.ReplaceAll(playlist, []byte(`KEYFORMAT="identity"`), []byte(`KEYFORMAT="org.w3.clearkey"`))
+		if bytes.Equal(relabelled, playlist) {
+			return nil
+		}
+		return os.WriteFile(path, relabelled, 0o644)
+	})
 }

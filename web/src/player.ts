@@ -2,7 +2,7 @@ import type { AbrAlgorithm } from "./abr";
 import { ThroughputEstimator } from "./abr/ewma";
 import { API_URL } from "./config";
 import { CAN_SELECT_LEVEL, createEngine, playsHlsNatively, resolveEngine } from "./engines";
-import type { EngineName, LevelInfo, Protocol, TrackInfo, TrackList } from "./engines/types";
+import type { EngineName, LevelInfo, Protocol, TrackInfo, TrackList, DrmConfig } from "./engines/types";
 import { QoESession } from "./qoe";
 
 // Re-exported so abr/types.ts, main.ts and experiment.ts keep importing from
@@ -29,8 +29,16 @@ export interface Asset {
   fps: number | null;
   duration_s: number | null;
   renditions: Rendition[];
-  hls_url: string | null;
-  dash_url: string | null;
+  /** "clearkey", "widevine-test" or null. URLs come from startPlayback(). */
+  drm: string | null;
+}
+
+/** POST /assets/{id}/playback: signed URLs, and DRM details if the asset is encrypted. */
+export interface PlaybackInfo {
+  hls_url: string;
+  dash_url: string;
+  drm: { key_system: string; license_url: string; token: string } | null;
+  expires_at: string;
 }
 
 /**
@@ -53,6 +61,8 @@ export interface PlayOptions {
     abr: AbrAlgorithm;
     /** Label for the network conditions, e.g. "2500k". Null if unlabelled. */
     networkProfile: string | null;
+    /** From drmConfig(): null for a clear asset. */
+    drm: DrmConfig | null;
     onEvent?: (e: PlayerEvent) => void;
 }
 
@@ -62,12 +72,35 @@ export async function fetchAsset(id: string): Promise<Asset> {
     return res.json() as Promise<Asset>;
 }
 
-// The API owns where media lives: it builds both URLs from MEDIA_BASE_URL. The
-// player asks rather than reconstructing them, so moving to a CDN is a
-// server-side config change this file never learns about.
-export function manifestURL(asset: Asset, protocol: Protocol): string {
-    const path = protocol === "dash" ? asset.dash_url : asset.hls_url;
-    if (!path) throw new Error(`no ${protocol} manifest; status is "${asset.status}"`);
+/**
+ * Ask to play: the API answers with URLs signed for this viewer and, for an
+ * encrypted asset, a token for the licence server. Each call mints new ones.
+ */
+export async function startPlayback(id: string): Promise<PlaybackInfo> {
+    // No body and no custom headers keep this a "simple" request, so the
+    // browser sends it straight away instead of preflighting it first.
+    const res = await fetch(`${API_URL}/assets/${id}/playback`, { method: "POST" });
+    if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(`playback refused: ${res.status} ${body.error ?? ""}`);
+    }
+    return res.json() as Promise<PlaybackInfo>;
+}
+
+// The API owns where media lives: it builds both URLs from MEDIA_BASE_URL and
+// signs them. The player asks rather than reconstructing them, so moving to a
+// CDN is a server-side config change this file never learns about.
+export function manifestURL(info: PlaybackInfo, protocol: Protocol): string {
+    return absolute(protocol === "dash" ? info.dash_url : info.hls_url);
+}
+
+/** The engines' view of the playback's DRM: null for a clear asset. */
+export function drmConfig(info: PlaybackInfo): DrmConfig | null {
+    if (!info.drm) return null;
+    return { keySystem: info.drm.key_system, licenseUrl: absolute(info.drm.license_url), token: info.drm.token };
+}
+
+function absolute(path: string): string {
     return path.startsWith("http") ? path : API_URL + path;
 }
 
@@ -243,6 +276,7 @@ export function play(video: HTMLVideoElement, options: PlayOptions): Playback {
     // about engines.
     const engine = createEngine(engineName, video, {
         ownAbr,
+        drm: options.drm,
 
         onManifest(found, audioTracks) {
             // Assigned, not inlined: decide() reads this at every tick, long

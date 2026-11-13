@@ -53,3 +53,11 @@ export interface Presentation {
     audio: AudioOption[];
     subtitles: SubtitleOption[];
 }
+
+/** `video/mp4; codecs="avc1.640028"` or `audio/mp4; codecs="mp4a.40.2"` from a rung's codecs. */
+export function mimeFor(rung: Rung, kind: "video" | "audio"): string {
+    const video = /^(avc1|avc3|hvc1|hev1|av01|vp09)\./;
+    const codec = rung.codecs.find((c) => (kind === "video" ? video.test(c) : !video.test(c)));
+    if (!codec) throw new Error(`mse: the ${rung.height}p rung lists no ${kind} codec`);
+    return `${kind}/mp4; codecs="${codec}"`;
+}

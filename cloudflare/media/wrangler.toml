@@ -1,0 +1,11 @@
+name = "fastforge-media"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+
+# Your media domain, the host in MEDIA_BASE_URL. The Worker becomes its origin.
+routes = [{ pattern = "media.mmedara.dev", custom_domain = true }]
+
+# The bucket the worker process uploads to: R2_BUCKET in .env.
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "fastforge-media"

@@ -20,7 +20,7 @@
 
 import type { AbrAlgorithm } from "./abr";
 import { reportSession } from "./beacon";
-import { fetchAsset, manifestURL, play } from "./player";
+import { fetchAsset, manifestURL, play, drmConfig, startPlayback } from "./player";
 import type { Asset, EngineName, Playback, PlayerEvent, Protocol } from "./player";
 import type { QoESnapshot } from "./qoe";
 
@@ -63,7 +63,6 @@ type TrialResult =
 
 interface TrialContext {
     asset: Asset;
-    url: string;
     networkProfile: string;
     engine: EngineName;
     protocol: Protocol;
@@ -95,7 +94,6 @@ export async function runExperiment(
     const ctx: TrialContext = {
         asset,
         networkProfile,
-        url: manifestURL(asset, config.protocol),
         engine: config.engine,
         protocol: config.protocol,
         // Long enough for a slow network to finish with heavy rebuffering,
@@ -181,13 +179,17 @@ async function runTrial(ctx: TrialContext, algorithm: AbrAlgorithm, label: strin
     // at normal speed, whatever the player was last set to.
     video.playbackRate = 1;
 
+    // A fresh playback per trial: a run outlasts a playback token's 30
+    // minutes, and every real viewer starts with new credentials too.
+    const info = await startPlayback(ctx.asset.asset_id);
     const playback = play(video, {
         asset: ctx.asset,
-        url: ctx.url,
+        url: manifestURL(info, ctx.protocol),
         engine: ctx.engine,
         protocol: ctx.protocol,
         abr: algorithm,
         networkProfile: label,
+        drm: drmConfig(info),
         onEvent: ctx.hooks.onEvent,
     });
     ctx.hooks.onPlayback(playback);
